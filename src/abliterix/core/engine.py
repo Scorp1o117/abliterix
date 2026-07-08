@@ -56,7 +56,16 @@ def resolve_model_class(
     use ``AutoModelForCausalLM``.
     """
     configs = PretrainedConfig.get_config_dict(model_id)
-    if any("vision_config" in cfg for cfg in configs):
+    config_dicts = configs if isinstance(configs, tuple) else (configs,)
+    config = config_dicts[0]
+
+    # Agents-A1 / Qwen3.5-MoE exposes multimodal config fields, but Abliterix
+    # steers only the language model. Loading it through ImageTextToText adds
+    # unnecessary vision wrapper plumbing and can break local-only text runs.
+    if config.get("model_type") == "qwen3_5_moe":
+        return AutoModelForCausalLM
+
+    if any("vision_config" in cfg for cfg in config_dicts if isinstance(cfg, dict)):
         return AutoModelForImageTextToText
     return AutoModelForCausalLM
 
@@ -432,7 +441,7 @@ class SteeringEngine:
             ) as error:  # Model loading may fail with diverse errors (OOM, dtype, CUDA)
                 self.model = None  # ty:ignore[invalid-assignment]
                 flush_memory()
-                print(f"[red]Failed[/] ({error})")
+                print(f"[red]Failed[/] ({type(error).__name__}: {error!r})")
                 continue
 
             if config.model.quant_method == QuantMode.BNB_4BIT:

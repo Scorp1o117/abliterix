@@ -342,7 +342,7 @@ def _auto_batch_size(
         tok_counts = [len(engine.tokenizer.encode(r)) for r in responses]
         return sum(tok_counts) / (t1 - t0)
 
-    batch_size = 1
+    batch_size = max(1, config.inference.min_batch_size)
     results: dict[int, float] = {}
 
     while batch_size <= config.inference.max_batch_size:
@@ -514,6 +514,7 @@ def run():
         # Infer --model.model-id flag if the last argument looks like a model identifier.
         if (
             len(sys.argv) > 1
+            and "--config" not in sys.argv
             and "--model.model-id" not in sys.argv
             and not sys.argv[-1].startswith("-")
         ):
@@ -749,7 +750,11 @@ def run():
     else:
         if config.inference.batch_size == 0:
             config.inference.batch_size = _auto_batch_size(engine, benign_msgs, config)
-        _detect_response_prefix(engine, benign_msgs, target_msgs)
+        if config.inference.skip_common_response_prefix:
+            print()
+            print("Skipping common response prefix check.")
+        else:
+            _detect_response_prefix(engine, benign_msgs, target_msgs)
 
     detector = RefusalDetector(config)
     try:

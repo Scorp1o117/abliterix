@@ -476,6 +476,16 @@ class InferenceConfig(BaseModel):
         description="Upper bound explored during automatic batch-size tuning.",
     )
 
+    min_batch_size: int = Field(
+        default=1,
+        description="Lower bound explored during automatic batch-size tuning.",
+    )
+
+    skip_common_response_prefix: bool = Field(
+        default=False,
+        description="Whether to skip common response prefix detection.",
+    )
+
     max_gen_tokens: int = Field(
         default=100,
         description="Token budget for each generated response.",

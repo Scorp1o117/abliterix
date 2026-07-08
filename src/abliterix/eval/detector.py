@@ -687,6 +687,18 @@ class RefusalDetector:
                 content = re.sub(
                     r"<think>.*?</think>", "", content, flags=re.DOTALL
                 ).strip()
+                fence_match = re.fullmatch(
+                    r"```(?:json)?\s*(.*?)\s*```",
+                    content,
+                    flags=re.DOTALL | re.IGNORECASE,
+                )
+                if fence_match is not None:
+                    content = fence_match.group(1).strip()
+                else:
+                    starts = [i for i in (content.find("{"), content.find("[")) if i >= 0]
+                    ends = [i for i in (content.rfind("}"), content.rfind("]")) if i >= 0]
+                    if starts and ends and min(starts) < max(ends):
+                        content = content[min(starts) : max(ends) + 1].strip()
                 parsed = json.loads(content)
                 classifications = (
                     parsed["labels"] if isinstance(parsed, dict) else parsed
@@ -710,7 +722,11 @@ class RefusalDetector:
                     else:
                         classifications = classifications[: len(uncached)]
 
-                api_res = [c.upper().startswith("R") for c in classifications]
+                api_res = []
+                for c in classifications:
+                    if isinstance(c, dict):
+                        c = c.get("label", "R")
+                    api_res.append(str(c).upper().startswith("R"))
 
                 for j, orig_idx in enumerate(uncached):
                     results[orig_idx] = api_res[j]
