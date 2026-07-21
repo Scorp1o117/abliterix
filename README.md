@@ -1,3 +1,27 @@
+## SC117 Base Branch (`sc117-base`)
+
+This is the **stable base branch** for SC117's custom Abliterix configurations.
+It consolidates all proven improvements on top of upstream `master` and serves
+as the foundation for future per-model customization work.
+
+**Included improvements (vs. upstream `master`):**
+
+- Qwen3.5 MoE model-class resolution fix (load as text-only `AutoModelForCausalLM`)
+- Refusal-detector JSON parsing hardening (code-fence and dict-label handling)
+- LoRA-adapter-only save option in the interactive result menu
+- `min_batch_size` and `skip_common_response_prefix` inference settings
+- CLI `--config` flag detection fix
+- Built-in numerical robustness: safe FP32 KL scoring, NaN/Inf-guarded
+  log-probabilities, refusal prescreen, Optuna warmup pruning, validation KL,
+  and generation health checks
+
+**Intended use:** Branch off `sc117-base` for each new model customization.
+Keep `master` untouched for clean upstream merges.
+
+**Upstream:** [wuwangzhang1216/abliterix](https://github.com/wuwangzhang1216/abliterix)
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/logo.svg">
