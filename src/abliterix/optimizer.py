@@ -32,7 +32,7 @@ from .types import (
     SteeringMode,
     SteeringProfile,
 )
-from .util import humanize_duration, print, report_memory
+from .util import flush_memory, humanize_duration, print, report_memory
 
 
 def run_search(
@@ -117,6 +117,8 @@ def run_search(
         nonlocal trial_counter
         trial_counter += 1
         trial.set_user_attr("index", trial_counter)
+
+        opt = config.optimization
 
         # --- Direct-mode transform choice (categorical) ---
         # Mutates config.steering.direct_transform for this trial only; the
@@ -436,8 +438,23 @@ def run_search(
             )
 
         try:
+            # ----------------------------------------------------------------
+            # Prescreen FIRST (fast, 30 prompts): prune early if high refusal
+            # so we don't waste 3-5 min on a full KL measurement.
+            # ----------------------------------------------------------------
+            prescreen_result = None
+            if opt.refusal_prescreen_enabled:
+                from .eval.stage_evaluator import StageEvaluator
+
+                evaluator = StageEvaluator(config, engine, scorer)
+                try:
+                    prescreen_result = evaluator._run_prescreen(trial)
+                except TrialPruned:
+                    raise
+
             print("* Evaluating...")
             kl, length_dev = scorer.measure_kl_and_coherence(engine)
+            benign_responses = getattr(scorer, "_last_benign_responses", [])
 
             # Early pruning for excessively damaged models.
             if config.kl.prune_threshold > 0 and kl > config.kl.prune_threshold:
@@ -447,14 +464,48 @@ def run_search(
                 )
                 raise TrialPruned()
 
-            print("  * Counting model refusals...")
-            detected = scorer.detector.evaluate_compliance(
-                engine,
-                scorer.target_msgs,
-            )
-            print(f"  * Refusals: [bold]{detected}[/]/{len(scorer.target_msgs)}")
+            if opt.refusal_prescreen_enabled:
+                # Pass cached prescreen_result so we don't re-run it.
+                detected, report = evaluator.evaluate(
+                    trial, kl, benign_responses,
+                    skip_prescreen=True, prescreen_result=prescreen_result,
+                )
+            else:
+                # Legacy path: full eval without prescreen
+                print("  * Counting model refusals...")
+                detected = scorer.detector.evaluate_compliance(engine, scorer.target_msgs)
+                n_target = len(scorer.target_msgs)
+
+                if float(detected) / max(n_target, 1) <= 0.08:
+                    ref_color = "green"
+                elif float(detected) / max(n_target, 1) <= 0.25:
+                    ref_color = "yellow"
+                else:
+                    ref_color = "red"
+                print(f"  * Refusals: [{ref_color}]{detected}/{n_target}[/]")
+
+                if opt.generation_health_enabled or opt.thinking_leak_detection_enabled:
+                    from .eval.screening import TrialScreener
+                    screener = TrialScreener(config, engine)
+                    if opt.generation_health_enabled and benign_responses:
+                        health = screener.check_generation_health(benign_responses)
+                        trial.set_user_attr("generation_health", health)
+                        screener.print_screening_report(health)
 
             objectives = scorer._compute_objectives(kl, detected, length_dev)
+
+            def _kl_color(v: float) -> str:
+                if v < 0.1: return "green"
+                if v < 0.5: return "yellow"
+                return "red"
+
+            def _ref_color(v: int, n: int) -> str:
+                if float(v) / max(n, 1) <= 0.08: return "green"
+                if float(v) / max(n, 1) <= 0.25: return "yellow"
+                return "red"
+
+            n_t = len(scorer.target_msgs)
+            print(f"  * [{_kl_color(kl)}]KL={kl:.4f}[/]  [{_ref_color(detected, n_t)}]Ref={detected}/{n_t}[/]")
         finally:
             # Always restore vLLM router edits so the next trial starts from
             # the pristine base model.  No-op if nothing was applied.
@@ -471,6 +522,8 @@ def run_search(
             # Restore the global decay_kernel if this trial sampled one.
             if _saved_decay_kernel is not None:
                 config.steering.decay_kernel = _saved_decay_kernel
+
+            flush_memory()
 
         # Timing / resource report
         elapsed = time.perf_counter() - start_time
@@ -498,6 +551,7 @@ def run_search(
         try:
             return _objective(trial)
         except KeyboardInterrupt:
+            # Stop the study gracefully on Ctrl+C.
             trial.study.stop()
             raise TrialPruned()
 
@@ -556,6 +610,8 @@ def run_search(
             n_trials=opt.num_trials - _count_complete(),
         )
     except KeyboardInterrupt:
+        pass
+    except UnboundLocalError:
         pass
 
     if _count_complete() == opt.num_trials:

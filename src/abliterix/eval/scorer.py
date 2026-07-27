@@ -10,6 +10,9 @@ The :class:`TrialScorer` orchestrates baseline capture during init and then
 provides :meth:`score_trial` to evaluate each Optuna trial.
 """
 
+import hashlib
+import json
+import os
 import statistics
 
 import torch
@@ -19,7 +22,7 @@ from torch import Tensor
 from ..data import load_prompt_dataset
 from ..settings import AbliterixConfig
 from ..types import ChatMessage
-from ..util import print
+from ..util import flush_memory, print, slugify_model_name
 from .detector import RefusalDetector
 
 
@@ -104,12 +107,87 @@ class TrialScorer:
         else:
             self._capture_baseline(engine)
 
+    def _baseline_cache_key(self) -> str:
+        key_data = {
+            "model_id": self.config.model.model_id,
+            "benign_eval": {
+                "dataset": self.config.benign_eval_prompts.dataset,
+                "split": self.config.benign_eval_prompts.split,
+                "column": self.config.benign_eval_prompts.column,
+            },
+            "target_eval": {
+                "dataset": self.config.target_eval_prompts.dataset,
+                "split": self.config.target_eval_prompts.split,
+                "column": self.config.target_eval_prompts.column,
+            },
+            "max_gen_tokens": self.config.inference.max_gen_tokens,
+            "min_gen_tokens": self.config.inference.min_gen_tokens,
+            "kl_token_count": self.config.kl.token_count,
+            "seed": self.config.seed,
+        }
+        raw = json.dumps(key_data, sort_keys=True)
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def _baseline_cache_path(self) -> str:
+        cache_dir = self.config.optimization.checkpoint_dir
+        slug = slugify_model_name(self.config.model.model_id)
+        return os.path.join(cache_dir, f"{slug}_baseline.pt")
+
+    def _save_baseline_cache(self) -> None:
+        path = self._baseline_cache_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        cache = {
+            "cache_key": self._baseline_cache_key(),
+            "baseline_logprobs": self.baseline_logprobs,
+            "baseline_mean_length": self.baseline_mean_length,
+            "baseline_stdev_length": self.baseline_stdev_length,
+            "baseline_single_token_lp": self.baseline_single_token_lp,
+            "baseline_refusal_count": self.baseline_refusal_count,
+            "baseline_continuations": self.baseline_continuations,
+            "baseline_continuation_nll": self.baseline_continuation_nll,
+        }
+        torch.save(cache, path)
+        print(f"* [dim]Baseline cached → {path}[/]")
+
+    def _load_baseline_cache(self) -> bool:
+        path = self._baseline_cache_path()
+        if not os.path.exists(path):
+            return False
+        try:
+            cache = torch.load(path, map_location="cpu", weights_only=False)
+            if cache.get("cache_key") != self._baseline_cache_key():
+                print("* [dim]Baseline cache stale (config changed), recomputing...[/]")
+                return False
+            self.baseline_logprobs = cache["baseline_logprobs"]
+            self.baseline_mean_length = cache["baseline_mean_length"]
+            self.baseline_stdev_length = cache["baseline_stdev_length"]
+            self.baseline_single_token_lp = cache["baseline_single_token_lp"]
+            self.baseline_refusal_count = cache["baseline_refusal_count"]
+            self.baseline_continuations = cache.get("baseline_continuations")
+            self.baseline_continuation_nll = cache.get("baseline_continuation_nll")
+            print(f"* Baseline loaded from cache")
+            print(
+                f"* Baseline response length: [bold]{self.baseline_mean_length:.1f}[/] "
+                f"+/- {self.baseline_stdev_length:.1f} words"
+            )
+            print(
+                f"* Initial refusals: [bold]{self.baseline_refusal_count}[/]"
+                f"/{len(self.target_msgs)}"
+            )
+            return True
+        except Exception as e:
+            print(f"* [yellow]Baseline cache load failed ({e}), recomputing...[/]")
+            return False
+
     def _capture_baseline(self, engine):
         """Capture baseline logprobs, response lengths, and refusal count.
 
         Automatically routes to the TP backend (vLLM/SGLang) if available,
         avoiding the slow HF pipeline-parallel generation path.
+        Skips computation entirely when a valid cache exists.
         """
+        if self._load_baseline_cache():
+            return
         # Capture baseline logprobs and response lengths in a single pass.
         # Route to TP backend if available.
         print("* Obtaining probability distributions and baseline response lengths...")
@@ -156,6 +234,19 @@ class TrialScorer:
             f"+/- {self.baseline_stdev_length:.1f} words"
         )
 
+        # Single-token baseline logprobs for top-1 disagreement (Ornith method).
+        print("* Obtaining single-token baseline logprobs for top-1 disagreement...")
+        self.baseline_single_token_lp = engine._logprobs_forward_pass(self.benign_msgs).cpu()
+
+        # Move averaged logprobs to CPU — only needed on-GPU during KL
+        # measurement, where _safe_kl_divergence handles device transfer.
+        if self.baseline_logprobs is not None and self.baseline_logprobs.is_cuda:
+            self.baseline_logprobs = self.baseline_logprobs.cpu()
+        if hasattr(self, "baseline_continuation_nll") and self.baseline_continuation_nll is not None:
+            self.baseline_continuation_nll = self.baseline_continuation_nll.cpu()
+
+        flush_memory()
+
         print("* Counting model refusals...")
         self.baseline_refusal_count = self.detector.evaluate_compliance(
             engine,
@@ -165,6 +256,8 @@ class TrialScorer:
             f"* Initial refusals: [bold]{self.baseline_refusal_count}[/]"
             f"/{len(self.target_msgs)}"
         )
+
+        self._save_baseline_cache()
 
     # ------------------------------------------------------------------
     # Individual metric helpers
@@ -251,6 +344,8 @@ class TrialScorer:
                 skip_special_tokens=True,
                 min_new_tokens=self.config.inference.min_gen_tokens,
             )
+
+        self._last_benign_responses = responses
 
         if self._use_vllm_continuation_kl(vllm_gen):
             kl = self._measure_vllm_continuation_kl(vllm_gen, adapter_path)

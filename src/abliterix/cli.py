@@ -6,6 +6,8 @@
 
 """Command-line interface: banner, device detection, and main orchestration."""
 
+import hashlib
+import json
 import math
 import os
 import random
@@ -43,7 +45,6 @@ from .optimizer import run_search
 from .settings import AbliterixConfig
 from .types import ChatMessage, VectorMethod
 from .util import (
-    ask_choice,
     flush_memory,
     print,
     report_memory,
@@ -268,11 +269,22 @@ def _handle_existing_checkpoint(
 
     choices += [
         Choice(title="Ignore the previous run and start from scratch", value="restart"),
-        Choice(title="Exit program", value=""),
+        Choice(title="Exit program", value="exit"),
     ]
 
     print()
-    choice = ask_choice("How would you like to proceed?", choices)
+    for i, c in enumerate(choices, 1):
+        print(f"  [{i}] {c.title}")
+    print()
+    while True:
+        try:
+            idx = int(input("Choice (1-3): ").strip())
+            if 1 <= idx <= len(choices):
+                choice = choices[idx - 1].value
+                break
+        except ValueError:
+            pass
+        print("[red]Please enter 1, 2, or 3.[/]")
 
     if choice == "continue":
         config = AbliterixConfig.model_validate_json(
@@ -754,7 +766,39 @@ def run():
             print()
             print("Skipping common response prefix check.")
         else:
-            _detect_response_prefix(engine, benign_msgs, target_msgs)
+            _prefix_cache = os.path.join(
+                config.optimization.checkpoint_dir,
+                slugify_model_name(config.model.model_id) + "_prefix.json",
+            )
+            _prefix_loaded = False
+            if os.path.exists(_prefix_cache):
+                import json as _json
+
+                try:
+                    with open(_prefix_cache) as _f:
+                        _pc = _json.load(_f)
+                    if _pc.get("model_id") == config.model.model_id:
+                        engine.response_prefix = _pc["prefix"]
+                        print(
+                            f"* Prefix loaded from cache: "
+                            f"[bold]{engine.response_prefix!r}[/]"
+                        )
+                        _prefix_loaded = True
+                except Exception:
+                    pass
+            if not _prefix_loaded:
+                _detect_response_prefix(engine, benign_msgs, target_msgs)
+                import json as _json
+
+                os.makedirs(config.optimization.checkpoint_dir, exist_ok=True)
+                with open(_prefix_cache, "w") as _f:
+                    _json.dump(
+                        {
+                            "model_id": config.model.model_id,
+                            "prefix": engine.response_prefix,
+                        },
+                        _f,
+                    )
 
     detector = RefusalDetector(config)
     try:
@@ -775,83 +819,120 @@ def run():
             return
 
         # Compute steering vectors from residual streams.
-        print()
-        print("Computing per-layer steering vectors...")
-        if _precomputed_benign_states is not None:
-            print("* Using pre-extracted residuals (speculators)")
-            benign_states = _precomputed_benign_states
-            target_states = _precomputed_target_states
-            del _precomputed_benign_states, _precomputed_target_states
-        else:
-            print("* Extracting residuals for benign prompts...")
-            benign_states = engine.extract_hidden_states_batched(benign_msgs)
-            print("* Extracting residuals for target prompts...")
-            target_states = engine.extract_hidden_states_batched(target_msgs)
+        # --- Steering data cache ---
+        _steering_cache_path = os.path.join(
+            config.optimization.checkpoint_dir,
+            slugify_model_name(config.model.model_id) + "_steering.pt",
+        )
+        _steering_cache_key = hashlib.sha256(json.dumps({
+            "model_id": config.model.model_id,
+            "benign": [config.benign_prompts.dataset, config.benign_prompts.split, config.benign_prompts.column],
+            "target": [config.target_prompts.dataset, config.target_prompts.split, config.target_prompts.column],
+            "vector_method": config.steering.vector_method.value,
+            "orthogonal_projection": config.steering.orthogonal_projection,
+            "projected_abliteration": config.steering.projected_abliteration,
+            "winsorize": config.steering.winsorize_vectors,
+            "winsorize_quantile": config.steering.winsorize_quantile,
+            "seed": config.seed,
+        }, sort_keys=True).encode()).hexdigest()[:16]
 
-        print(f"* Vector method: [bold]{config.steering.vector_method.value}[/]")
+        _steering_cached = False
+        _cached_safety_experts = None
+        if os.path.exists(_steering_cache_path):
+            try:
+                _sc = torch.load(_steering_cache_path, map_location="cpu", weights_only=False)
+                if _sc.get("cache_key") == _steering_cache_key:
+                    benign_states = _sc["benign_states"]
+                    target_states = _sc["target_states"]
+                    vectors = _sc["vectors"]
+                    _cached_safety_experts = _sc.get("safety_experts")
+                    _steering_cached = True
+                    print()
+                    print(f"* Steering data loaded from cache")
+                else:
+                    print()
+                    print("* [dim]Steering cache stale, recomputing...[/]")
+            except Exception as _e:
+                print(f"* [yellow]Steering cache load failed ({_e})[/]")
 
-        if config.iterative.enabled:
-            if config.steering.vector_method == VectorMethod.RDO:
-                raise ValueError(
-                    "vector_method='rdo' is incompatible with iterative "
-                    "abliteration (the iterative loop re-extracts directions "
-                    "from cached states each round and has no RDO wiring). "
-                    "Disable iterative.enabled to use RDO."
-                )
-            from .iterative import iterative_abliterate
-
-            vectors, iter_stats = iterative_abliterate(
-                engine,
-                benign_msgs,
-                target_msgs,
-                config,
-                benign_states=benign_states,
-                target_states=target_states,
-            )
-            # Model restored inside iterative_abliterate.
-            # Re-extract clean states for discriminative layer selection / analysis.
-            if config.steering.discriminative_layer_selection:
-                print(
-                    "* Re-extracting clean residuals for discriminative layer selection..."
-                )
+        if not _steering_cached:
+            print()
+            print("Computing per-layer steering vectors...")
+            if _precomputed_benign_states is not None:
+                print("* Using pre-extracted residuals (speculators)")
+                benign_states = _precomputed_benign_states
+                target_states = _precomputed_target_states
+                del _precomputed_benign_states, _precomputed_target_states
+            else:
+                print("* Extracting residuals for benign prompts...")
                 benign_states = engine.extract_hidden_states_batched(benign_msgs)
+                print("* Extracting residuals for target prompts...")
                 target_states = engine.extract_hidden_states_batched(target_msgs)
-        elif config.steering.vector_method == VectorMethod.RDO:
-            from .rdo import optimize_rdo_direction
 
-            vectors = optimize_rdo_direction(
-                engine,
-                target_msgs,
-                benign_msgs,
-                config,
-                benign_states=benign_states,
-                target_states=target_states,
-            )
-        else:
-            vectors = compute_steering_vectors(
-                benign_states,
-                target_states,
-                config.steering.vector_method,
-                config.steering.orthogonal_projection,
-                winsorize=config.steering.winsorize_vectors,
-                winsorize_quantile=config.steering.winsorize_quantile,
-                projected_abliteration=config.steering.projected_abliteration,
-                ot_components=config.steering.ot_components,
-                n_directions=config.steering.n_directions,
-                sra_base_method=config.steering.sra_base_method,
-                sra_n_atoms=config.steering.sra_n_atoms,
-                sra_ridge_alpha=config.steering.sra_ridge_alpha,
-                ablate_harmfulness_direction=config.steering.ablate_harmfulness_direction,
-                harmfulness_layer_band=tuple(config.steering.harmfulness_layer_band),
-                som_grid_h=config.steering.som_grid_h,
-                som_grid_w=config.steering.som_grid_w,
-                som_n_iters=config.steering.som_n_iters,
-                som_initial_lr=config.steering.som_initial_lr,
-                som_seed=config.steering.som_seed,
-                sae_path=config.steering.sae_path,
-                sae_layer=config.steering.sae_layer,
-                sae_top_k=config.steering.sae_top_k,
-            )
+            print(f"* Vector method: [bold]{config.steering.vector_method.value}[/]")
+
+            if config.iterative.enabled:
+                if config.steering.vector_method == VectorMethod.RDO:
+                    raise ValueError(
+                        "vector_method='rdo' is incompatible with iterative "
+                        "abliteration (the iterative loop re-extracts directions "
+                        "from cached states each round and has no RDO wiring). "
+                        "Disable iterative.enabled to use RDO."
+                    )
+                from .iterative import iterative_abliterate
+
+                vectors, iter_stats = iterative_abliterate(
+                    engine,
+                    benign_msgs,
+                    target_msgs,
+                    config,
+                    benign_states=benign_states,
+                    target_states=target_states,
+                )
+                # Model restored inside iterative_abliterate.
+                # Re-extract clean states for discriminative layer selection / analysis.
+                if config.steering.discriminative_layer_selection:
+                    print(
+                        "* Re-extracting clean residuals for discriminative layer selection..."
+                    )
+                    benign_states = engine.extract_hidden_states_batched(benign_msgs)
+                    target_states = engine.extract_hidden_states_batched(target_msgs)
+            elif config.steering.vector_method == VectorMethod.RDO:
+                from .rdo import optimize_rdo_direction
+
+                vectors = optimize_rdo_direction(
+                    engine,
+                    target_msgs,
+                    benign_msgs,
+                    config,
+                    benign_states=benign_states,
+                    target_states=target_states,
+                )
+            else:
+                vectors = compute_steering_vectors(
+                    benign_states,
+                    target_states,
+                    config.steering.vector_method,
+                    config.steering.orthogonal_projection,
+                    winsorize=config.steering.winsorize_vectors,
+                    winsorize_quantile=config.steering.winsorize_quantile,
+                    projected_abliteration=config.steering.projected_abliteration,
+                    ot_components=config.steering.ot_components,
+                    n_directions=config.steering.n_directions,
+                    sra_base_method=config.steering.sra_base_method,
+                    sra_n_atoms=config.steering.sra_n_atoms,
+                    sra_ridge_alpha=config.steering.sra_ridge_alpha,
+                    ablate_harmfulness_direction=config.steering.ablate_harmfulness_direction,
+                    harmfulness_layer_band=tuple(config.steering.harmfulness_layer_band),
+                    som_grid_h=config.steering.som_grid_h,
+                    som_grid_w=config.steering.som_grid_w,
+                    som_n_iters=config.steering.som_n_iters,
+                    som_initial_lr=config.steering.som_initial_lr,
+                    som_seed=config.steering.som_seed,
+                    sae_path=config.steering.sae_path,
+                    sae_layer=config.steering.sae_layer,
+                    sae_top_k=config.steering.sae_top_k,
+                )
 
         analyzer = ResidualAnalyzer(config, engine, benign_states, target_states)
 
@@ -947,11 +1028,14 @@ def run():
         # SGLang path does not yet have an equivalent editor and keeps the
         # original skip behaviour.
         safety_experts: dict[int, list[tuple[int, float]]] | None = None
+        if _steering_cached and _cached_safety_experts is not None:
+            safety_experts = _cached_safety_experts
+            print(f"* MoE expert profiling loaded from cache ({len(safety_experts)} layers)")
         # Only do HF router profiling when the HF model is actually loaded.
         # Under vLLM fast extraction path, engine.model is None (lightweight
         # engine) — VLLMMoEEditor does its own profiling via collective_rpc
         # during the phase transition below.
-        if (
+        elif (
             engine.model is not None
             and engine.has_expert_routing()
             and config.model.backend != "sglang"
@@ -971,6 +1055,18 @@ def run():
                 safety_experts = engine.identify_safety_experts(
                     benign_msgs, target_msgs
                 )
+
+        # Save steering data cache
+        if not _steering_cached:
+            os.makedirs(config.optimization.checkpoint_dir, exist_ok=True)
+            torch.save({
+                "cache_key": _steering_cache_key,
+                "benign_states": benign_states,
+                "target_states": target_states,
+                "vectors": vectors,
+                "safety_experts": safety_experts,
+            }, _steering_cache_path)
+            print(f"* [dim]Steering data cached → {_steering_cache_path}[/]")
 
         # ----- TP backend: Phase transition (vLLM or SGLang) -----
         tp_gen = None
@@ -1306,17 +1402,27 @@ def run():
                 "harmfulness_pair": pair_vectors,
             }
 
-        study = run_search(
-            config,
-            engine,
-            scorer,
-            vectors,
-            safety_experts,
-            storage,
-            benign_states=benign_states,
-            target_states=target_states,
-            steering_vector_variants=_vector_variants,
-        )
+        study = None
+        try:
+            study = run_search(
+                config,
+                engine,
+                scorer,
+                vectors,
+                safety_experts,
+                storage,
+                benign_states=benign_states,
+                target_states=target_states,
+                steering_vector_variants=_vector_variants,
+            )
+        except (KeyboardInterrupt, UnboundLocalError):
+            print()
+            print("[yellow]Search interrupted — showing results so far...[/]")
+
+        if study is None:
+            study = optuna.load_study(
+                study_name="abliterix", storage=storage,
+            )
 
         if config.non_interactive:
             completed = sum(1 for t in study.trials if t.state == TrialState.COMPLETE)
@@ -1335,6 +1441,8 @@ def run():
             vectors,
             safety_experts,
             storage,
+            benign_states=benign_states,
+            target_states=target_states,
         )
     finally:
         detector.close()

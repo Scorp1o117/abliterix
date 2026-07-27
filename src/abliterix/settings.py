@@ -1223,6 +1223,58 @@ class OptimizationConfig(BaseModel):
         description="Fixed seed for the Optuna sampler and PyTorch RNG.",
     )
 
+    # --- Staged evaluation / screening ---
+
+    refusal_prescreen_enabled: bool = Field(
+        default=False,
+        description="Run a quick refusal prescreen on a subset before full evaluation.",
+    )
+
+    refusal_prescreen_size: int = Field(
+        default=30,
+        description="Number of prompts used in the refusal prescreen.",
+    )
+
+    refusal_prescreen_pass_max: int = Field(
+        default=8,
+        description="Max prescreen refusals to classify as 'low' (good trial).",
+    )
+
+    refusal_prescreen_prune_min: int = Field(
+        default=19,
+        description="Min prescreen refusals to classify as 'high' (prune immediately).",
+    )
+
+    refusal_prescreen_seed: int = Field(
+        default=117,
+        description="Seed for prescreen random index selection.",
+    )
+
+    prescreen_estimation_enabled: bool = Field(
+        default=True,
+        description="Skip full evaluation for 'low' trials and use prescreen estimate.",
+    )
+
+    validation_kl_enabled: bool = Field(
+        default=False,
+        description="Measure KL divergence on a held-out validation set.",
+    )
+
+    validation_kl_size: int = Field(
+        default=20,
+        description="Number of prompts for validation KL measurement.",
+    )
+
+    generation_health_enabled: bool = Field(
+        default=False,
+        description="Enable generation health checks (ngram repetition, token frequency).",
+    )
+
+    thinking_leak_detection_enabled: bool = Field(
+        default=False,
+        description="Detect chain-of-thought markers in abliterated model outputs.",
+    )
+
     seed_trials: list[dict] = Field(
         default_factory=list,
         description=(
