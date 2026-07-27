@@ -4,19 +4,19 @@ This is the **stable base branch** for SC117's custom Abliterix configurations.
 It consolidates all proven improvements on top of upstream `master` and serves
 as the foundation for future per-model customization work.
 
-**Included improvements (vs. upstream `master`):**
+**Branch log (mandatory for SC117 work):** see **[BRANCH_LOG.md](BRANCH_LOG.md)**  
+for differences vs upstream, SC117-only features, and the changelog.  
+**Every change on this branch must update that file.**
 
-- Qwen3.5 MoE model-class resolution fix (load as text-only `AutoModelForCausalLM`)
-- Refusal-detector JSON parsing hardening (code-fence and dict-label handling)
-- LoRA-adapter-only save option in the interactive result menu
-- `min_batch_size` and `skip_common_response_prefix` inference settings
-- CLI `--config` flag detection fix
-- Built-in numerical robustness: safe FP32 KL scoring, NaN/Inf-guarded
-  log-probabilities, refusal prescreen, Optuna warmup pruning, validation KL,
-  and generation health checks
+**Highlights (vs. upstream `master` — details in BRANCH_LOG.md):**
+
+- ROCm / bnb-4bit MoE load hardening (`compute_dtype=bf16`, fp16→bf16 promote, dequant cache cap)
+- Optional staged trial pipeline: refusal prescreen, validation KL, generation health, thinking-leak checks
+- Restart caches (prefix / steering / baseline) and machine recipes (Laguna, Agents-A1, …)
+- LoRA-adapter-only save; non-TTY numeric menus (`abliterix | tee`)
 
 **Intended use:** Branch off `sc117-base` for each new model customization.
-Keep `master` untouched for clean upstream merges.
+Keep upstream-facing work on clean `pr/*` branches.
 
 **Upstream:** [wuwangzhang1216/abliterix](https://github.com/wuwangzhang1216/abliterix)
 
