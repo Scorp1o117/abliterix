@@ -103,10 +103,14 @@ class StageEvaluator:
             If the prescreen classifies the trial as high-refusal.
         """
         opt = self.config.optimization
+        compliance_objective: float | None = None
+
         # ----------------------------------------------------------------
         # Stage 1 & 2: Prescreen + estimation
         # ----------------------------------------------------------------
-        if skip_prescreen:
+        if not opt.refusal_prescreen_enabled:
+            detected_full, skip_full_eval = 0, False
+        elif skip_prescreen:
             if prescreen_result is None:
                 raise ValueError(
                     "prescreen_result must be provided when skip_prescreen=True"
@@ -119,10 +123,17 @@ class StageEvaluator:
         # Stage 3: Full evaluation (if not skipped by prescreen estimation)
         # ----------------------------------------------------------------
         if not skip_full_eval:
-            print("  * Counting model refusals...")
-            detected_full = self.scorer.detector.evaluate_compliance(
-                self.engine, self.scorer.target_msgs,
+            measure_compliance = getattr(
+                self.scorer, "measure_compliance_objective", None
             )
+            if callable(measure_compliance):
+                detected_full, compliance_objective = measure_compliance(self.engine)
+            else:
+                print("  * Counting model refusals...")
+                detected_full = self.scorer.detector.evaluate_compliance(
+                    self.engine,
+                    self.scorer.target_msgs,
+                )
             trial.set_user_attr("refusals_score_source", "full")
 
         # Color-coded refusal output
@@ -156,6 +167,19 @@ class StageEvaluator:
                 screener.print_screening_report(health)
                 screening_report["generation_health"] = health
 
+            if opt.thinking_leak_detection_enabled and benign_responses:
+                leaked = screener.check_thinking_leak(benign_responses)
+                trial.set_user_attr("thinking_leak_detected", leaked)
+                if leaked:
+                    print("  * Thinking leak: [yellow]detected[/]")
+                    if "generation_health" in screening_report:
+                        screening_report["generation_health"]["thinking_leak_detected"] = True
+                else:
+                    print("  * Thinking leak: [green]none[/]")
+                screening_report["thinking_leak_detected"] = leaked
+
+        # Expose compliance override for upstream _compute_objectives when available.
+        screening_report["compliance_objective"] = compliance_objective
         return detected_full, screening_report
 
     # ------------------------------------------------------------------

@@ -450,8 +450,27 @@ def run_search(
                 target_states=target_states,
             )
 
+        # Optional SC117 staged pipeline: refusal prescreen, validation KL,
+        # generation health, thinking-leak checks. Defaults are off so upstream
+        # behaviour is unchanged unless configs enable the flags.
+        use_staged = (
+            opt.refusal_prescreen_enabled
+            or opt.generation_health_enabled
+            or opt.validation_kl_enabled
+            or opt.thinking_leak_detection_enabled
+        )
+        evaluator = None
+        prescreen_result = None
+        if opt.refusal_prescreen_enabled:
+            from .eval.stage_evaluator import StageEvaluator
+
+            evaluator = StageEvaluator(config, engine, scorer)
+            # Run prescreen before expensive KL so high-refusal trials prune early.
+            prescreen_result = evaluator._run_prescreen(trial)
+
         print("* Evaluating...")
         kl, length_dev = scorer.measure_kl_and_coherence(engine)
+        benign_responses = getattr(scorer, "_last_benign_responses", [])
         damage_metric = getattr(scorer, "last_damage_metric", None)
         damage_metric_name = (
             damage_metric.name if damage_metric is not None else "full_distribution_kl"
@@ -465,29 +484,55 @@ def run_search(
             )
             raise TrialPruned()
 
-        measure_compliance = getattr(
-            scorer,
-            "measure_compliance_objective",
-            None,
-        )
-        if callable(measure_compliance):
-            detected, compliance_objective = measure_compliance(engine)
-            objectives = scorer._compute_objectives(
+        compliance_objective = None
+        if use_staged:
+            from .eval.stage_evaluator import StageEvaluator
+
+            if evaluator is None:
+                evaluator = StageEvaluator(config, engine, scorer)
+            detected, screening_report = evaluator.evaluate(
+                trial,
                 kl,
-                detected,
-                length_dev,
-                compliance_objective_override=compliance_objective,
+                benign_responses,
+                skip_prescreen=opt.refusal_prescreen_enabled,
+                prescreen_result=prescreen_result,
             )
+            compliance_objective = screening_report.get("compliance_objective")
+            if compliance_objective is not None:
+                objectives = scorer._compute_objectives(
+                    kl,
+                    detected,
+                    length_dev,
+                    compliance_objective_override=compliance_objective,
+                )
+            else:
+                objectives = scorer._compute_objectives(kl, detected, length_dev)
         else:
-            # Compatibility with scorer-like integrations that predate the
-            # per-sample compliance contract.
-            print("  * Counting model refusals...")
-            detected = scorer.detector.evaluate_compliance(
-                engine,
-                scorer.target_msgs,
+            measure_compliance = getattr(
+                scorer,
+                "measure_compliance_objective",
+                None,
             )
-            print(f"  * Refusals: [bold]{detected}[/]/{len(scorer.target_msgs)}")
-            objectives = scorer._compute_objectives(kl, detected, length_dev)
+            if callable(measure_compliance):
+                detected, compliance_objective = measure_compliance(engine)
+                objectives = scorer._compute_objectives(
+                    kl,
+                    detected,
+                    length_dev,
+                    compliance_objective_override=compliance_objective,
+                )
+            else:
+                # Compatibility with scorer-like integrations that predate the
+                # per-sample compliance contract.
+                print("  * Counting model refusals...")
+                detected = scorer.detector.evaluate_compliance(
+                    engine,
+                    scorer.target_msgs,
+                )
+                print(
+                    f"  * Refusals: [bold]{detected}[/]/{len(scorer.target_msgs)}"
+                )
+                objectives = scorer._compute_objectives(kl, detected, length_dev)
 
         # Timing / resource report
         elapsed = time.perf_counter() - start_time
