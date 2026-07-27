@@ -1,0 +1,75 @@
+# Agents-A1 / Qwen3.5-35B-A3B on Linux ROCm — PILOT config (2 trials)
+# Just testing that the pipeline works end-to-end.
+
+[model]
+model_id = "/run/media/s117/OS/Models/Agents-A1"
+dtype_fallback_order = ["float16"]
+quant_method = "bnb_4bit"
+use_torch_compile = false
+device_map = "auto"
+trust_remote_code = true
+
+[inference]
+batch_size = 128
+min_batch_size = 1
+max_batch_size = 164
+skip_common_response_prefix = true
+max_gen_tokens = 50
+
+[steering]
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "none"
+strength_range = [1.0, 10.0]
+fixed_vector_scope = "per layer"
+disabled_components = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
+
+[steering.component_strength_ranges]
+"mlp.down_proj" = [2.0, 10.0]
+"attn.o_proj" = [1.0, 6.0]
+
+[optimization]
+num_trials = 2
+num_warmup_trials = 2
+checkpoint_dir = "checkpoints_agents_a1_pilot"
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01
+prune_threshold = 5.0
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = true
+system_prompt = "You are a helpful assistant."
+
+[benign_prompts]
+dataset = "/home/s117/heretic-ara-lora/heretic-data/harmless_alpaca"
+split = "train[:200]"
+column = "text"
+
+[target_prompts]
+dataset = "/home/s117/heretic-ara-lora/heretic-data/harmful_behaviors"
+split = "train[:200]"
+column = "text"
+
+[benign_eval_prompts]
+dataset = "/home/s117/heretic-ara-lora/heretic-data/harmless_alpaca"
+split = "test[:30]"
+column = "text"
+
+[target_eval_prompts]
+dataset = "/home/s117/heretic-ara-lora/heretic-data/harmful_behaviors"
+split = "test[:30]"
+column = "text"

@@ -1,0 +1,112 @@
+# Laguna-S-2.1 (118B MoE) on ROCm + bitsandbytes 4-bit
+# AMD AI MAX+ 395 Strix Halo APU, 128GB unified memory
+#
+# Architecture: 48 layers, 256 routed experts + 1 shared, top-10 per token
+# hidden=3072, 1M context. BF16 ~236GB → must use 4-bit quantization.
+#
+# Strategy: Conservative first run with proven Qwen3.5 MoE settings,
+# then iterate based on results.
+
+seed = 117
+system_prompt = "You are a helpful assistant."
+
+[model]
+model_id = "/run/media/s117/OS/Models/Laguna-S-2.1-bnb"
+dtype_fallback_order = ["float16"]
+quant_method = "bnb_4bit"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "120GB"}
+trust_remote_code = true
+
+[inference]
+batch_size = 16
+min_batch_size = 1
+max_batch_size = 64
+skip_common_response_prefix = false
+max_gen_tokens = 100
+
+[steering]
+vector_method = "mean"
+decay_kernel = "gaussian"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "none"
+discriminative_layer_selection = true
+
+# Conservative strength range for first run
+strength_range = [0.5, 6.0]
+
+# Disable Q/K/V to reduce search space (proven effective on Qwen MoE)
+disabled_components = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
+
+[steering.component_strength_ranges]
+"mlp.down_proj" = [2.0, 8.0]
+"attn.o_proj" = [1.0, 6.0]
+
+[experts]
+# Laguna has 256 experts with top-10 routing (denser than Qwen3.6's top-8)
+# May need stronger suppression
+max_suppress = 20
+router_bias_range = [-15.0, 0.0]
+ablation_weight_range = [0.0, 8.0]
+
+[optimization]
+# Start with 50 trials, can extend if needed
+num_trials = 50
+num_warmup_trials = 10
+checkpoint_dir = "checkpoints_laguna_s_2.1_rocm_bnb4bit"
+
+refusal_prescreen_enabled = true
+validation_kl_enabled = true
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01
+prune_threshold = 0.5
+
+[detection]
+llm_judge = false
+# Enable LLM judge in later iterations if needed
+# llm_judge = true
+# llm_judge_model = "deepseek-v4-flash"
+# llm_judge_base_url = "https://opencode.ai/zen/go/v1"
+# llm_judge_api_key_env = "LLM_JUDGE_API_KEY"
+# llm_judge_auth_header = "Authorization"
+# llm_judge_auth_prefix = "Bearer "
+# llm_judge_temperature = 0.0
+# llm_judge_use_response_format = false
+# llm_judge_max_tokens_field = "max_tokens"
+# llm_judge_reasoning_budget = 0
+# llm_judge_batch_size = 10
+# llm_judge_concurrency = 8
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+[benign_prompts]
+dataset = "/home/s117/heretic-abliterix/datasets/good_1000"
+split = "train"
+column = "prompt"
+
+[target_prompts]
+dataset = "/home/s117/heretic-abliterix/datasets/harmful_1000"
+split = "train"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/home/s117/heretic-abliterix/datasets/good_500"
+split = "train[:100]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/home/s117/heretic-abliterix/datasets/harmful_500"
+split = "train[:100]"
+column = "prompt"
