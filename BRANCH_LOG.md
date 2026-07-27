@@ -11,7 +11,7 @@
 | 远端 | `origin` → https://github.com/Scorp1o117/abliterix |
 | 上游 | `upstream` → https://github.com/wuwangzhang1216/abliterix |
 | 最近对齐上游 | **v1.12.1**（`76a7a31`，merge `09c6e53`） |
-| 本日志最近更新 | 2026-07-27 |
+| 本日志最近更新 | 2026-07-27 (PR #95 CI) |
 
 ---
 
@@ -142,6 +142,13 @@
 ```
 
 ---
+
+### 2026-07-27 — PR #95 CI/tests 补全
+
+- **类型**: docs / test（上游 PR 分支）
+- **摘要**: 在 `pr/bnb-rocm-moe-stability` 上 `ruff format` + 新增 `tests/test_bnb_moe_load_fixes.py`；本地 ruff/ty 通过；聚焦 pytest 26 passed。PR 评论已贴硬件背景与检查结果。
+- **涉及**: `pr/bnb-rocm-moe-stability` @ `405dfe8`；PR https://github.com/wuwangzhang1216/abliterix/pull/95
+- **与上游关系**: 已 push 到 PR 分支（fork）
 
 ### 2026-07-27 — 建立分支日志
 
