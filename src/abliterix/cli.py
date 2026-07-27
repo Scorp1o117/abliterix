@@ -48,11 +48,12 @@ from .util import (
     flush_memory,
     print,
     report_memory,
+    reserved_unallocated_vram,
     set_seed,
     slugify_model_name,
 )
 from .types import SteeringMode
-from .vectors import compute_steering_vectors
+from .vectors import compute_configured_steering_vectors
 
 
 # ---------------------------------------------------------------------------
@@ -909,29 +910,8 @@ def run():
                     target_states=target_states,
                 )
             else:
-                vectors = compute_steering_vectors(
-                    benign_states,
-                    target_states,
-                    config.steering.vector_method,
-                    config.steering.orthogonal_projection,
-                    winsorize=config.steering.winsorize_vectors,
-                    winsorize_quantile=config.steering.winsorize_quantile,
-                    projected_abliteration=config.steering.projected_abliteration,
-                    ot_components=config.steering.ot_components,
-                    n_directions=config.steering.n_directions,
-                    sra_base_method=config.steering.sra_base_method,
-                    sra_n_atoms=config.steering.sra_n_atoms,
-                    sra_ridge_alpha=config.steering.sra_ridge_alpha,
-                    ablate_harmfulness_direction=config.steering.ablate_harmfulness_direction,
-                    harmfulness_layer_band=tuple(config.steering.harmfulness_layer_band),
-                    som_grid_h=config.steering.som_grid_h,
-                    som_grid_w=config.steering.som_grid_w,
-                    som_n_iters=config.steering.som_n_iters,
-                    som_initial_lr=config.steering.som_initial_lr,
-                    som_seed=config.steering.som_seed,
-                    sae_path=config.steering.sae_path,
-                    sae_layer=config.steering.sae_layer,
-                    sae_top_k=config.steering.sae_top_k,
+                vectors = compute_configured_steering_vectors(
+                    benign_states, target_states, config
                 )
 
         analyzer = ResidualAnalyzer(config, engine, benign_states, target_states)
@@ -1078,6 +1058,15 @@ def run():
             print()
             print(f"[bold]Phase transition: HF → {backend_name}[/]")
 
+            # Hidden-state stacks kept for later use (discriminative layer
+            # selection / non-LoRA steering) may still be GPU-resident when
+            # inference.offload_outputs_to_cpu=false; move them to CPU so the
+            # TP workers spawned below don't see that VRAM as used (issue #83).
+            if benign_states is not None:
+                benign_states = benign_states.cpu()
+            if target_states is not None:
+                target_states = target_states.cpu()
+
             # Build projection cache.  If the HF model is loaded (needed for
             # non-speculators path), use it.  Otherwise read weights directly
             # from safetensors on disk — avoids the 3+ min HF model load.
@@ -1127,6 +1116,21 @@ def run():
                     vectors,
                 )
             flush_memory()
+            # VRAM still reserved by this (HF-phase) process is invisible
+            # garbage to the TP workers spawned below — they count it as
+            # used memory and refuse to start ("Free memory on device ...
+            # is less than desired GPU memory utilization", issue #83).
+            _stuck = reserved_unallocated_vram()
+            if _stuck > 2 * 1024**3:
+                print(
+                    f"[yellow]Warning: {_stuck / 1024**3:.1f} GB of VRAM "
+                    f"is still reserved after unloading the HF model — "
+                    f"something is pinning the freed weights.  The "
+                    f"{backend_name} workers may fail to start with 'Free "
+                    f"memory on device' errors; if they do, please report "
+                    f"this at "
+                    f"https://github.com/wuwangzhang1216/abliterix/issues.[/]"
+                )
             report_memory()
 
             # Load model with tensor parallelism.
@@ -1443,6 +1447,7 @@ def run():
             storage,
             benign_states=benign_states,
             target_states=target_states,
+            steering_vector_variants=_vector_variants,
         )
     finally:
         detector.close()
