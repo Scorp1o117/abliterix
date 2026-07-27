@@ -340,6 +340,9 @@ def _run_benchmarks(
     engine: SteeringEngine,
     steering_vectors: Tensor,
     trial,
+    safety_experts=None,
+    benign_states=None,
+    target_states=None,
 ):
     """Run lm-eval-harness benchmarks on the steered model (optionally vs base).
 
@@ -390,6 +393,13 @@ def _run_benchmarks(
         # upload, chat) operate on the decensored model again.
         print("Re-applying steering...")
         engine.restore_baseline()
+
+        routing = None
+        moe_params = trial.user_attrs.get("moe_parameters")
+        if moe_params is not None:
+            from .types import ExpertRoutingConfig
+            routing = ExpertRoutingConfig(**moe_params)
+
         apply_steering(
             engine,
             steering_vectors,
@@ -398,6 +408,11 @@ def _run_benchmarks(
                 k: SteeringProfile(**v)
                 for k, v in trial.user_attrs["parameters"].items()
             },
+            config,
+            safety_experts=safety_experts,
+            routing_config=routing,
+            benign_states=benign_states,
+            target_states=target_states,
         )
 
     _print_lm_eval_table(results_ab, results_base)
@@ -411,6 +426,8 @@ def show_interactive_results(
     steering_vectors: Tensor,
     safety_experts,
     storage: JournalStorage,
+    benign_states=None,
+    target_states=None,
 ):
     """Post-optimisation interactive menu: trial selection, save, upload, chat."""
     while True:
@@ -459,14 +476,25 @@ def show_interactive_results(
 
         while True:
             print()
-            trial = ask_choice("Which trial do you want to use?", choices)
+            try:
+                trial = ask_choice("Which trial do you want to use?", choices)
+            except KeyboardInterrupt:
+                print()
+                print("[yellow]Ctrl-C detected — staying in menu.[/]")
+                print("[dim]Pick 'Exit program' from the menu (or Ctrl-D) to quit.[/]")
+                continue
 
             if trial == "continue":
                 while True:
                     try:
-                        n_extra = ask_text(
-                            "How many additional trials do you want to run?"
-                        )
+                        try:
+                            n_extra = ask_text(
+                                "How many additional trials do you want to run?"
+                            )
+                        except KeyboardInterrupt:
+                            print()
+                            print("[yellow]Ctrl-C detected — staying in menu.[/]")
+                            break
                         if not n_extra:
                             n_extra = 0
                             break
@@ -497,9 +525,12 @@ def show_interactive_results(
                         steering_vectors,
                         safety_experts,
                         storage,
+                        benign_states=benign_states,
+                        target_states=target_states,
                     )
                 except KeyboardInterrupt:
-                    pass
+                    print()
+                    print("[yellow]Interrupted — returning to menu.[/]")
 
                 if _count() == config.optimization.num_trials:
                     study.set_user_attr("finished", True)
@@ -507,6 +538,7 @@ def show_interactive_results(
                 break
 
             elif trial is None or trial == "":
+                # EOF on stdin (terminal closed) — exit gracefully.
                 return
 
             # --- Restore selected trial ---
@@ -519,6 +551,13 @@ def show_interactive_results(
             print("* Resetting model...")
             engine.restore_baseline()
             print("* Applying steering...")
+
+            routing = None
+            moe_params = trial.user_attrs.get("moe_parameters")
+            if moe_params is not None:
+                from .types import ExpertRoutingConfig
+                routing = ExpertRoutingConfig(**moe_params)
+
             apply_steering(
                 engine,
                 steering_vectors,
@@ -527,6 +566,11 @@ def show_interactive_results(
                     k: SteeringProfile(**v)
                     for k, v in trial.user_attrs["parameters"].items()
                 },
+                config,
+                safety_experts=safety_experts,
+                routing_config=routing,
+                benign_states=benign_states,
+                target_states=target_states,
             )
 
             while True:
@@ -561,7 +605,12 @@ def show_interactive_results(
                             _chat_with_model(config, engine)
 
                         case "Run standard benchmarks (lm-eval)":
-                            _run_benchmarks(config, engine, steering_vectors, trial)
+                            _run_benchmarks(
+                                config, engine, steering_vectors, trial,
+                                safety_experts=safety_experts,
+                                benign_states=benign_states,
+                                target_states=target_states,
+                            )
 
                 except Exception as error:  # Catch-all for interactive menu actions
                     print(f"[red]Error: {error}[/]")

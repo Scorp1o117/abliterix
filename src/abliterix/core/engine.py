@@ -207,6 +207,8 @@ class SteeringEngine:
         self.response_prefix = ""
         self.needs_reload = False
         self._dequant_cache: dict[int, Tensor] = {}
+        self._dequant_cache_bytes: int = 0
+        self._dequant_cache_max_bytes: int = 4 * 1024**3  # 4 GB
 
         # Cached metadata — populated by prepare_for_unload() before the HF
         # model is freed, so the optimizer can still query layer/component
@@ -428,6 +430,24 @@ class SteeringEngine:
                             "orthogonal projection will clip on write-back. "
                             "Set fp8_handling='materialize' or pre-dequant "
                             "offline.[/]"
+                        )
+
+                # bnb 4-bit: promote non-quantized params (embed, norm, lm_head)
+                # to bf16 so hidden states don't overflow fp16 range in
+                # deep models.  Params4bit stores as uint8 → untouched.
+                if (
+                    config.model.quant_method == QuantMode.BNB_4BIT
+                    and dtype not in ("bfloat16", "auto")
+                ):
+                    n_conv = 0
+                    for _n, _p in self.model.named_parameters():
+                        if _p.dtype == torch.float16:
+                            _p.data = _p.data.to(torch.bfloat16)
+                            n_conv += 1
+                    if n_conv:
+                        print(
+                            f"  [dim]Promoted {n_conv} non-quantized params "
+                            f"fp16→bf16[/]"
                         )
 
                 # Smoke-test: a single forward pass catches dtype-related
@@ -807,7 +827,7 @@ class SteeringEngine:
         """Translate the user-facing QuantMode into a BitsAndBytesConfig."""
         qm = self.config.model.quant_method
         if qm == QuantMode.BNB_4BIT:
-            compute_dtype = torch.bfloat16 if dtype == "auto" else getattr(torch, dtype)
+            compute_dtype = torch.bfloat16
             return BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=compute_dtype,
@@ -923,7 +943,11 @@ class SteeringEngine:
         with suppress(Exception):
             _register("mlp.down_proj", layer.mlp.down_proj)  # ty:ignore[possibly-missing-attribute]
 
-        # Per-expert down-projection (e.g. Qwen3).
+        # Per-expert down-projection for MoE models.
+        # Each expert's down_proj is registered as "mlp.down_proj" so it
+        # shares the same steering profile.  Combined with discriminative
+        # layer selection, only refusal-relevant experts in relevant layers
+        # are actually steered — the rest are skipped.
         with suppress(Exception):
             for expert in layer.mlp.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 _register("mlp.down_proj", expert.down_proj)  # ty:ignore[possibly-missing-attribute]
@@ -936,7 +960,7 @@ class SteeringEngine:
         with suppress(Exception):
             _register("mlp.down_proj", layer.mlp.shared_experts.down_proj)  # ty:ignore[possibly-missing-attribute]
 
-        # Phi-3.5-MoE.
+        # Phi-3.5-MoE per-expert.
         with suppress(Exception):
             for expert in layer.block_sparse_moe.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 _register("mlp.down_proj", expert.w2)  # ty:ignore[possibly-missing-attribute]
@@ -945,7 +969,7 @@ class SteeringEngine:
         with suppress(Exception):
             _register("mlp.down_proj", layer.shared_mlp.output_linear)  # ty:ignore[possibly-missing-attribute]
 
-        # Granite MoE Hybrid — MoE layers.
+        # Granite MoE per-expert.
         with suppress(Exception):
             for expert in layer.moe.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 _register("mlp.down_proj", expert.output_linear)  # ty:ignore[possibly-missing-attribute]
@@ -977,7 +1001,7 @@ class SteeringEngine:
         with suppress(Exception):
             _register("attn.o_proj", layer.mixer.o_proj)  # ty:ignore[possibly-missing-attribute]
 
-        # NemotronH — per-expert MoE via mixer.experts.
+        # NemotronH per-expert.
         with suppress(Exception):
             for expert in layer.mixer.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 _register("mlp.down_proj", expert.down_proj)  # ty:ignore[possibly-missing-attribute]
