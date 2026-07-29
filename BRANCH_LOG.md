@@ -143,6 +143,13 @@
 
 ---
 
+### 2026-07-29 — PR #95 native bf16 判定
+
+- **类型**: fix（上游 PR 分支）
+- **摘要**: 按作者第二轮意见：`_bf16_compute_supported()`（ROCm 或 sm≥8），compute 与 promote 共用；测试改 patch 该 helper。
+- **提交**: 见 `pr/bnb-rocm-moe-stability` 最新 tip
+- **与上游关系**: https://github.com/wuwangzhang1216/abliterix/pull/95
+
 ### 2026-07-29 — PR #95 按作者 review 修改
 
 - **类型**: fix（上游 PR 分支 `pr/bnb-rocm-moe-stability`）
