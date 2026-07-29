@@ -143,6 +143,13 @@
 
 ---
 
+### 2026-07-29 — PR #95 按作者 review 修改
+
+- **类型**: fix（上游 PR 分支 `pr/bnb-rocm-moe-stability`）
+- **摘要**: 采纳 wuwangzhang1216 审查意见：export_adapter、model.text_only、bf16 硬件回退、promote 去 gate、_cache_dequant、非 TTY 全覆盖、行为单测。
+- **提交**: `862f4f6`；PR 评论已回复。
+- **与上游关系**: https://github.com/wuwangzhang1216/abliterix/pull/95
+
 ### 2026-07-27 — PR #95 CI/tests 补全
 
 - **类型**: docs / test（上游 PR 分支）
