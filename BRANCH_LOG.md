@@ -144,6 +144,13 @@
 
 ---
 
+### 2026-08-05 — fix: validation KL 改同前缀 teacher-forcing（此前自由生成导致 KL 虚高 50 倍）
+
+- **类型**: fix（fork 独有筛查指标）
+- **摘要**: `_run_validation_kl` 用 `generate_and_score_batched` 让 steered 模型**自由生成**并捕获逐步 logprob，再对比 baseline 在固定 continuation 上的 logprob——一旦 steering 改变第一个 token（成功的 trial 正是如此），两侧前缀分叉，KL 爆炸式虚高。LFM2.5-2.6B 实测 `validation_kl_mean` 0.93~4.24（成功 trial 反而更高），而正确同前缀的优化目标 `kl_divergence` 仅 0.009~0.3；Agents-A1 两指标一致（~0.015）佐证。修法：steered 侧改用 `score_continuation_logprobs_batched` 在 baseline 固定续写（`baseline_continuations[validation_indices]`）上打分，两侧前缀逐 token 一致；vLLM 路径同样处理（带 adapter_path）。top-1 disagreement 部分本就用 `_logprobs_forward_pass` 同前缀，未动。baseline 续写缺失时跳过并提示。注：当前运行中的 trial 进程不受影响（旧代码），下次启动生效。
+- **涉及**: `src/abliterix/eval/stage_evaluator.py`
+- **与上游关系**: 仅 fork（`_run_validation_kl` 为 fork 独有）
+
 ### 2026-08-05 — fix: 固定全局 seed（TOML 顶层标量字段不生效）
 
 - **类型**: fix / chore（运行脚本 + 配方）

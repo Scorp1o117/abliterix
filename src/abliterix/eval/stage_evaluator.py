@@ -246,22 +246,33 @@ class StageEvaluator:
         vllm_gen = getattr(self.engine, "_vllm_gen", None)
         adapter_path = getattr(self.engine, "_current_adapter_path", None)
 
+        # Fixed baseline continuations for the validation subset.  Both the
+        # baseline and the steered model must be scored on the SAME
+        # teacher-forced prefixes, otherwise the KL explodes once the
+        # steered model's free-run trajectory diverges from baseline (which
+        # is exactly what a successful trial does).  Using the baseline
+        # continuations for both sides keeps every KL step prefix-identical.
+        baseline_cont = getattr(self.scorer, "baseline_continuations", None)
+        if baseline_cont is None or self.scorer.baseline_logprobs is None:
+            print(
+                "  [yellow]validation KL skipped: baseline continuations "
+                "unavailable[/]"
+            )
+            return
+        baseline_cont = baseline_cont[self._validation_indices]
+
         if vllm_gen is not None:
-            v_responses, v_logprobs = vllm_gen.generate_and_score_batched(
+            v_logprobs = vllm_gen.score_continuation_logprobs_batched(
                 self._validation_msgs,
-                max_new_tokens=self.config.inference.max_gen_tokens,
-                kl_token_count=self.config.kl.token_count,
-                skip_special_tokens=True,
-                min_new_tokens=self.config.inference.min_gen_tokens,
+                baseline_cont,
+                self.config.kl.token_count,
                 adapter_path=adapter_path,
             )
         else:
-            v_responses, v_logprobs = self.engine.generate_and_score_batched(
+            v_logprobs = self.engine.score_continuation_logprobs_batched(
                 self._validation_msgs,
-                max_new_tokens=self.config.inference.max_gen_tokens,
-                kl_token_count=self.config.kl.token_count,
-                skip_special_tokens=True,
-                min_new_tokens=self.config.inference.min_gen_tokens,
+                baseline_cont,
+                self.config.kl.token_count,
             )
 
         # Baseline logprobs for just the validation subset.
