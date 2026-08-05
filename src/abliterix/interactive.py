@@ -156,11 +156,12 @@ def _save_lora_adapter_locally(config: AbliterixConfig, engine: SteeringEngine):
     if not save_dir:
         return
 
-    if not hasattr(engine.model, "save_pretrained"):
-        raise RuntimeError("Current model does not support save_pretrained().")
-
     print("Saving LoRA adapter only...")
-    engine.model.save_pretrained(save_dir, safe_serialization=True)
+    # Route through export_adapter() so the empty-adapter guard (PR #95,
+    # f540863) runs: after a merged export consumed the LoRA layers,
+    # self.model is a PeftModel shell with zero lora_ params and a bare
+    # save_pretrained() would silently write an empty adapter file.
+    engine.export_adapter(save_dir)
     engine.tokenizer.save_pretrained(save_dir)
     print(f"LoRA adapter saved to [bold]{save_dir}[/].")
     print("[green]Base model weights were not merged or exported.[/]")

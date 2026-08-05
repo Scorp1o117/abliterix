@@ -144,6 +144,13 @@
 
 ---
 
+### 2026-08-05 — fix: LoRA 保存走 export_adapter()，补上空 adapter guard 缺口
+
+- **类型**: fix（PR #95 后续）
+- **摘要**: 时序复现：先尝试 merged 导出 → `export_merged()` 执行 `merge_and_unload()` 把 LoRA 折叠进基座并移除 lora 参数（`needs_reload=True`），随后 save_pretrained 若失败（如官方 generation_config 校验），再选"保存 LoRA"时 `_save_lora_adapter_locally` 直接 `engine.model.save_pretrained()`——**绕过** PR #95 `f540863` 在 `export_adapter()` 里加的空 adapter guard，空壳 PeftModel 静默写出 0 张量（40 字节 `{"__metadata__":{"format":"pt"}}`）safetensors。LFM2.5-2.6B trial32 实测导出 40 字节空文件。修法：`_save_lora_adapter_locally` 改调 `engine.export_adapter(save_dir)`，guard 生效（`needs_reload` 或零 lora_ 参数时报错并提示重新选 trial）。
+- **涉及**: `src/abliterix/interactive.py`
+- **与上游关系**: PR #95 同源修复的补丁（上游 f540863 只覆盖 export_adapter 路径）
+
 ### 2026-08-05 — fix: 导出兼容官方 generation config 缺 do_sample + TUI 管道渲染
 
 - **类型**: fix（导出路径 + 运行脚本）
