@@ -144,6 +144,13 @@
 
 ---
 
+### 2026-08-05 — fix: run_lfm2.5.sh 显式传 --non-interactive/--overwrite-checkpoint
+
+- **类型**: chore（运行脚本）
+- **摘要**: 顶层 TOML 布尔（`non_interactive`/`overwrite_checkpoint`）被 `CliSettingsSource(cli_implicit_flags=True)` 未传参时注入的默认 `False` 覆盖，导致脚本在管道（无 TTY）下弹出 checkpoint 恢复交互菜单、`input()` EOF 崩溃。嵌套字段（如 `optimization.refusal_prescreen_enabled`）不受影响，仅顶层布尔中招。修法：runner 显式传两个 flag（CLI 优先于 TOML）。缓存（baseline/steering/prefix）为独立 key 文件，不受 journal 覆盖影响。
+- **涉及**: `run_lfm2.5.sh`
+- **与上游关系**: 仅 fork（机台脚本）
+
 ### 2026-08-05 — fix: validation KL 多 token 形状 + scorer 测试 fixture
 
 - **类型**: fix / test（仅 fork 筛查代码与测试）
