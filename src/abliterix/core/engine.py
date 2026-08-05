@@ -543,15 +543,7 @@ class SteeringEngine:
                         config.model.experts_implementation
                     )
 
-                self.model = resolve_model_class(model_id).from_pretrained(
-                    model_id,
-                    **{_dtype_kwarg: dtype},
-                    device_map=config.model.device_map,
-                    max_memory=self.max_memory,
-                    trust_remote_code=self.trusted_models.get(model_id),
-                    offload_folder="/tmp/offload",
-                    **extra,
-                )
+                self.model = self._load_model_fast(model_id, dtype, extra)
 
                 if self.trusted_models.get(model_id) is None:
                     self.trusted_models[model_id] = True
@@ -683,6 +675,70 @@ class SteeringEngine:
                 f"* MoE model detected: [bold]{n_experts}[/] fused experts, "
                 f"[bold]{n_gate_layers}[/] router layers"
             )
+
+    # ------------------------------------------------------------------
+    # Fast single-GPU load: avoid accelerate's per-tensor H2D copy
+    # ------------------------------------------------------------------
+
+    def _load_model_fast(
+        self,
+        model_id: str,
+        dtype: Any,
+        extra: dict[str, Any],
+    ) -> PreTrainedModel:
+        """Load weights via CPU mmap -> materialize -> bulk CUDA move.
+
+        accelerate's ``device_map='auto'`` copies each safetensors tensor
+        to the GPU one at a time; on ROCm, every first touch of a
+        file-backed mmap page costs ~1.2 s of fixed overhead, so a
+        266-tensor model takes ~5 minutes to load. Loading on CPU (lazy
+        mmap, ~0.4 s), materializing the pages with ``clone`` (~0.8 s),
+        then moving the whole model in one ``.to('cuda')`` (~0.6 s)
+        skips that per-tensor cost for single-GPU BF16 loads.
+
+        Falls back to the accelerate device-map path for explicit device
+        maps, max_memory offload, or quantized models.
+        """
+        is_fp8 = (
+            self.config.model.quant_method == QuantMode.FP8
+            or self._is_native_fp8
+        )
+        use_fast = (
+            self.config.model.device_map == "auto"
+            and self.max_memory is None
+            and self.config.model.quant_method == QuantMode.NONE
+            and not is_fp8
+        )
+        if not use_fast:
+            return resolve_model_class(model_id).from_pretrained(
+                model_id,
+                **{_dtype_kwarg: dtype},
+                device_map=self.config.model.device_map,
+                max_memory=self.max_memory,
+                trust_remote_code=self.trusted_models.get(model_id),
+                offload_folder="/tmp/offload",
+                **extra,
+            )
+
+        print("  [dim]fast load: CPU mmap -> materialize -> bulk CUDA[/]")
+        model = resolve_model_class(model_id).from_pretrained(
+            model_id,
+            **{_dtype_kwarg: dtype},
+            trust_remote_code=self.trusted_models.get(model_id),
+            **extra,
+        )
+        # Materialize lazy mmap-backed safetensors pages into plain
+        # memory; keep shared storages (tied embeddings) shared.
+        with torch.no_grad():
+            clones: dict[int, Tensor] = {}
+            for p in model.parameters():
+                if p.data.storage().size() == 0:
+                    continue
+                key = p.data.storage().data_ptr()
+                if key not in clones:
+                    clones[key] = p.data.clone()
+                p.data = clones[key]
+        return model.to("cuda")
 
     # ------------------------------------------------------------------
     # FP8 dequantization workaround
@@ -1454,13 +1510,10 @@ class SteeringEngine:
         if qconfig is not None:
             extra["quantization_config"] = qconfig
 
-        self.model = resolve_model_class(self.config.model.model_id).from_pretrained(
+        self.model = self._load_model_fast(
             self.config.model.model_id,
-            **{_dtype_kwarg: dtype},
-            device_map=self.config.model.device_map,
-            max_memory=self.max_memory,
-            trust_remote_code=self.trusted_models.get(self.config.model.model_id),
-            **extra,
+            dtype,
+            extra,
         )
         if self.config.model.quant_method == QuantMode.FP8 or self._is_native_fp8:
             if not self._should_skip_fp8_dequant():

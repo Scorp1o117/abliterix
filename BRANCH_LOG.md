@@ -144,6 +144,13 @@
 
 ---
 
+### 2026-08-05 — feat: 单卡 BF16 快速加载（绕开 accelerate 逐张量 H2D copy）
+
+- **类型**: perf（引擎加载路径）
+- **摘要**: `device_map='auto'` 下 accelerate 把每个 safetensors mmap 懒加载张量逐个 copy 到 GPU；ROCm 上 file-backed mmap 页首次触碰有 ~1.2s/张量固定开销（DMA page pin），266 张量的 LFM2.5-2.6B（5.4GB）加载要 5 分半，而 70GB GGUF（llama.cpp 顺序 mmap 预读）只要 5 分钟。新增 `_load_model_fast()`：CPU 懒加载（~0.4s）→ 全参数 `clone()` 物化 mmap 页（~0.8s，共享 storage 去重保持 tie）→ 整体 `.to('cuda')`（~0.6s），引擎初始化含 smoke test 共 **3.9s**（原 5:25，约 84×）。仅当 `device_map='auto'` 且无 `max_memory` 且 `quant_method=none` 且非 FP8 时启用；显式 device map / 多卡 offload / 量化模型走原路径。`__init__` 与 `restore_baseline` reload 两处共用。
+- **涉及**: `src/abliterix/core/engine.py`
+- **与上游关系**: 仅 fork（ROCm 单卡优化；上游若合并需确认非 ROCm 平台无此开销时仍安全——条件限定 device_map='auto' 单卡即可，通用有益）
+
 ### 2026-08-05 — fix: run_lfm2.5.sh 显式传 --non-interactive/--overwrite-checkpoint
 
 - **类型**: chore（运行脚本）
