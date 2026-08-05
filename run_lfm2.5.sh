@@ -19,8 +19,18 @@ echo "  config: $CONFIG"
 echo "  log: $LOGFILE"
 echo
 
-PYTHONUNBUFFERED=1 abliterix \
-  --config "$CONFIG" \
-  --seed 117 \
-  --overwrite-checkpoint \
-  2>&1 | ( trap '' INT; tee "$LOGFILE" )
+# Interactive TUI (no --non-interactive) renders with rich prompts and
+# questionary — piping stdout through tee corrupts the TUI display.
+# Only tee when we are NOT on a TTY (e.g. cron / nohup batch runs).
+if [ -t 1 ]; then
+  PYTHONUNBUFFERED=1 abliterix \
+    --config "$CONFIG" \
+    --seed 117 \
+    --overwrite-checkpoint
+else
+  PYTHONUNBUFFERED=1 abliterix \
+    --config "$CONFIG" \
+    --seed 117 \
+    --overwrite-checkpoint \
+    2>&1 | ( trap '' INT; tee "$LOGFILE" )
+fi

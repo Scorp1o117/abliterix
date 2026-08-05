@@ -110,6 +110,27 @@ def ask_merge_strategy(config: AbliterixConfig, engine: SteeringEngine) -> str |
 # ---------------------------------------------------------------------------
 
 
+def _sanitize_generation_config(model) -> None:
+    """Make ``save_pretrained`` accept the model's generation config.
+
+    transformers 5.x validates ``GenerationConfig`` on save: sampling-only
+    fields (``temperature``, ``top_p``, ``top_k``, ...) trigger a hard error
+    when ``do_sample`` is not True.  Several official model repos (e.g.
+    LiquidAI/LFM2.5-2.6B) ship such a config.  Since greedy decoding is the
+    actual default behaviour, drop the sampling-only fields on save instead
+    of silently enabling sampling.
+    """
+    gen_cfg = getattr(model, "generation_config", None)
+    if gen_cfg is None or getattr(gen_cfg, "do_sample", False):
+        return
+    for field in ("temperature", "top_p", "top_k", "min_p", "typical_p"):
+        if getattr(gen_cfg, field, None) is not None:
+            try:
+                setattr(gen_cfg, field, None)
+            except Exception:
+                pass
+
+
 def _save_model_locally(config: AbliterixConfig, engine: SteeringEngine):
     """Save a merged model to a local directory."""
     save_dir = ask_path("Path to the folder:")
@@ -120,6 +141,7 @@ def _save_model_locally(config: AbliterixConfig, engine: SteeringEngine):
         return
     print("Saving merged model...")
     merged = engine.export_merged()
+    _sanitize_generation_config(merged)
     merged.save_pretrained(save_dir)
     del merged
     flush_memory()

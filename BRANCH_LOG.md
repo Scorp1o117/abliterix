@@ -144,6 +144,13 @@
 
 ---
 
+### 2026-08-05 — fix: 导出兼容官方 generation config 缺 do_sample + TUI 管道渲染
+
+- **类型**: fix（导出路径 + 运行脚本）
+- **摘要**: ① LiquidAI/LFM2.5-2.6B 官方 `generation_config.json` 带 `temperature=0.1` 但无 `do_sample`，transformers 5.x 在 `save_pretrained` 时严格校验报 `GenerationConfig is invalid`，合并导出失败。新增 `interactive._sanitize_generation_config()`：`do_sample` 非 True 时把仅采样字段（temperature/top_p/top_k/min_p/typical_p）置 None 再保存（greedy 本就是实际默认行为，非静默改采样）；`_save_model_locally` 调用。上游 master 无此处理（已查）。② `run_lfm2.5.sh` 的 `2>&1 | tee` 管道在交互 TUI 下使 rich/questionary 渲染错乱（导出输入路径界面花屏）。改为 `[ -t 1 ]` 检测：TTY 直接跑（无管道），非 TTY（cron/nohup）才 tee。
+- **涉及**: `src/abliterix/interactive.py`, `run_lfm2.5.sh`
+- **与上游关系**: ① 可上游化（对任意带此类官方 config 的模型有益）；② 仅 fork 脚本
+
 ### 2026-08-05 — fix: validation KL 改同前缀 teacher-forcing（此前自由生成导致 KL 虚高 50 倍）
 
 - **类型**: fix（fork 独有筛查指标）
