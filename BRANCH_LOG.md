@@ -172,6 +172,12 @@
 - **涉及**: `configs/lfm2.5_2.6b_rocm.toml`, `configs/lfm2.5_2.6b_rocm_smoke.toml`, `run_lfm2.5.sh`
 - **与上游关系**: 仅 fork（机台配方）
 
+### 2026-08-05 — PR #95 修 test_export_contract
+
+- **类型**: test（上游 PR 分支）
+- **摘要**: 作者指出全量 pytest 因 needs_reload 未初始化失败；按他的补丁修好 happy-path。
+- **与上游关系**: https://github.com/wuwangzhang1216/abliterix/pull/95
+
 ### 2026-07-30 — PR #95 empty-adapter guard + 作者第三轮补丁
 
 - **类型**: fix（上游 PR 分支）
