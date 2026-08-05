@@ -143,6 +143,13 @@
 
 ---
 
+### 2026-07-30 — PR #95 empty-adapter guard + 作者第三轮补丁
+
+- **类型**: fix（上游 PR 分支）
+- **摘要**: merge 后禁止空 LoRA 导出；DEQUANT_CACHE_MAX_BYTES 共享；_build_quant_config 去掉死参数；非 TTY Ctrl-C 返回 None；测试加强。
+- **提交**: `f540863` on `pr/bnb-rocm-moe-stability`
+- **与上游关系**: https://github.com/wuwangzhang1216/abliterix/pull/95
+
 ### 2026-07-29 — PR #95 native bf16 判定
 
 - **类型**: fix（上游 PR 分支）
