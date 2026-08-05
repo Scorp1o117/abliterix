@@ -144,6 +144,13 @@
 
 ---
 
+### 2026-08-05 — fix: validation KL 多 token 形状 + scorer 测试 fixture
+
+- **类型**: fix / test（仅 fork 筛查代码与测试）
+- **摘要**: ① `stage_evaluator._run_validation_kl` 假设引擎已把多 token logprobs 平均成 `(batch, vocab)`，实际 `kl_token_count>1` 时返回 `(batch, step, vocab)`，`sum(dim=-1).tolist()` 产生嵌套 list，`statistics.mean` TypeError 崩溃（LFM2.5-2.6B smoke token_count=3 实测触发）。改为 sum vocab 后对 step 维求平均，与 `_safe_kl_divergence` 语义一致；单 token 路径不变。② `test_scorer.py` 4 个失败单测修复：fake engine 补 `_logprobs_forward_pass` stub（fork 加 Ornith top-1 时漏更新 fixture）、SimpleNamespace 外壳透传该方法、4 个测试各挂 `tmp_path` 隔离 baseline 缓存键（此前共享 `checkpoints/--dummy--model_baseline.pt` 互相串扰）。test_scorer.py 现 25 passed 全绿。
+- **涉及**: `src/abliterix/eval/stage_evaluator.py`, `tests/test_scorer.py`
+- **与上游关系**: 仅 fork；`_run_validation_kl` 与缓存为 fork 独有
+
 ### 2026-08-05 — fix: baseline cache save 缺 baseline_continuation_nll 属性
 
 - **类型**: fix（仅 fork 缓存代码）

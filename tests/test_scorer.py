@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 sys.argv = ["test", "--model.model-id", "dummy/model"]
 
@@ -398,9 +399,10 @@ def test_in_place_combined_measurement_preserves_nll_metric_identity(capsys):
     assert "KL divergence" not in output
 
 
-def test_in_place_baseline_skips_unused_sampler_logprobs(capsys):
+def test_in_place_baseline_skips_unused_sampler_logprobs(capsys, tmp_path):
     scorer = _make_scorer()
     scorer.config.model.use_in_place_editing = True
+    scorer.config.optimization.checkpoint_dir = str(tmp_path)
     scorer.benign_msgs = ["prompt-a", "prompt-b"]
     scorer.target_msgs = []
     scorer.detector = SimpleNamespace(evaluate_compliance=lambda *_args: 0)
@@ -415,7 +417,14 @@ def test_in_place_baseline_skips_unused_sampler_logprobs(capsys):
         def score_continuations_nll(self, *args, **kwargs):
             return torch.tensor([1.0, 2.0])
 
-    engine = SimpleNamespace(_vllm_gen=FakeVLLM())
+        def _logprobs_forward_pass(self, messages):
+            return F.log_softmax(torch.randn(len(messages), 8), dim=-1)
+
+    fake = FakeVLLM()
+    engine = SimpleNamespace(
+        _vllm_gen=fake,
+        _logprobs_forward_pass=fake._logprobs_forward_pass,
+    )
 
     scorer._capture_baseline(engine)
 
@@ -429,8 +438,9 @@ def test_in_place_baseline_skips_unused_sampler_logprobs(capsys):
     assert "in-place KL" not in output
 
 
-def test_hf_multitoken_kl_scores_baseline_and_trial_on_shared_continuation():
+def test_hf_multitoken_kl_scores_baseline_and_trial_on_shared_continuation(tmp_path):
     scorer = _make_scorer()
+    scorer.config.optimization.checkpoint_dir = str(tmp_path)
     scorer.config.kl.token_count = 2
     scorer.config.inference.min_gen_tokens = None
     scorer.config.inference.max_gen_tokens = 8
@@ -485,6 +495,9 @@ def test_hf_multitoken_kl_scores_baseline_and_trial_on_shared_continuation():
             self.scored_continuations.append(list(continuations))
             return baseline if len(self.scored_continuations) == 1 else current
 
+        def _logprobs_forward_pass(self, messages):
+            return F.log_softmax(torch.randn(len(messages), 8), dim=-1)
+
     engine = FakeHFEngine()
     scorer._capture_baseline(engine)
     kl, deviation = scorer.measure_kl_and_coherence(engine)
@@ -498,8 +511,9 @@ def test_hf_multitoken_kl_scores_baseline_and_trial_on_shared_continuation():
     assert deviation == pytest.approx(0.0)
 
 
-def test_hf_single_token_kl_retains_single_pass_generation_fast_path():
+def test_hf_single_token_kl_retains_single_pass_generation_fast_path(tmp_path):
     scorer = _make_scorer()
+    scorer.config.optimization.checkpoint_dir = str(tmp_path)
     scorer.config.kl.token_count = 1
     scorer.benign_msgs = ["prompt"]
     scorer.target_msgs = []
@@ -524,6 +538,9 @@ def test_hf_single_token_kl_retains_single_pass_generation_fast_path():
         def score_continuation_logprobs_batched(self, *_args, **_kwargs):
             raise AssertionError("single-token fast path must stay single-pass")
 
+        def _logprobs_forward_pass(self, messages):
+            return F.log_softmax(torch.randn(len(messages), 8), dim=-1)
+
     engine = FakeHFEngine()
     scorer._capture_baseline(engine)
     kl, deviation = scorer.measure_kl_and_coherence(engine)
@@ -533,8 +550,9 @@ def test_hf_single_token_kl_retains_single_pass_generation_fast_path():
     assert deviation == pytest.approx(0.0)
 
 
-def test_tp_multitoken_kl_scores_shared_continuation_with_current_adapter():
+def test_tp_multitoken_kl_scores_shared_continuation_with_current_adapter(tmp_path):
     scorer = _make_scorer()
+    scorer.config.optimization.checkpoint_dir = str(tmp_path)
     scorer.config.kl.token_count = 2
     scorer.config.inference.min_gen_tokens = None
     scorer.benign_msgs = ["prompt"]
@@ -572,10 +590,14 @@ def test_tp_multitoken_kl_scores_shared_continuation_with_current_adapter():
             self.score_continuations.append(list(continuations))
             return baseline if adapter_path is None else current
 
+        def _logprobs_forward_pass(self, messages):
+            return F.log_softmax(torch.randn(len(messages), 8), dim=-1)
+
     backend = FakeTPBackend()
     engine = SimpleNamespace(
         _vllm_gen=backend,
         _current_adapter_path="/tmp/adapter",
+        _logprobs_forward_pass=backend._logprobs_forward_pass,
     )
 
     scorer._capture_baseline(engine)

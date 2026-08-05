@@ -272,10 +272,14 @@ class StageEvaluator:
         if base_lp.device != cur_lp.device:
             base_lp = base_lp.to(cur_lp.device)
 
-        # Engine returns logprobs averaged over kl_token_count positions → (batch, vocab).
-        # F.kl_div with reduction="none" gives (batch, vocab); sum over vocab → per-prompt KL.
+        # Multi-token capture returns (batch, step, vocab); single-token keeps
+        # (batch, vocab).  Sum KL over vocab, then average over the step axis
+        # (same per-token averaging as _safe_kl_divergence) → per-prompt KL.
         kl_none = F.kl_div(cur_lp, base_lp, reduction="none", log_target=True)
-        kl_per_prompt = kl_none.sum(dim=-1).cpu().tolist()
+        kl_per_tensor = kl_none.sum(dim=-1)
+        if kl_per_tensor.dim() > 1:
+            kl_per_tensor = kl_per_tensor.mean(dim=-1)
+        kl_per_prompt = kl_per_tensor.cpu().tolist()
         if isinstance(kl_per_prompt, float):
             kl_per_prompt = [kl_per_prompt]
 
