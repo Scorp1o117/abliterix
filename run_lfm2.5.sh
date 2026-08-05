@@ -21,6 +21,6 @@ echo
 
 PYTHONUNBUFFERED=1 abliterix \
   --config "$CONFIG" \
-  --non-interactive \
+  --seed 117 \
   --overwrite-checkpoint \
   2>&1 | ( trap '' INT; tee "$LOGFILE" )

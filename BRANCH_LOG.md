@@ -144,6 +144,13 @@
 
 ---
 
+### 2026-08-05 — fix: 固定全局 seed（TOML 顶层标量字段不生效）
+
+- **类型**: fix / chore（运行脚本 + 配方）
+- **摘要**: 实测 pydantic-settings `TomlConfigSettingsSource` 在此堆栈**只读嵌套 section**，顶层标量（`seed`/`non_interactive`/`overwrite_checkpoint`/`system_prompt`）被静默丢弃（`src()` 返回键仅含 section 名）。有效通道是 CLI flag（`--seed 117`）与 `AX_` 环境变量（`AX_SEED=117`）。此前 LFM2.5 完整搜索每次随机种子 → trial 轨迹不可复现、checkpoint 缓存失去意义。修法：`run_lfm2.5.sh` 显式 `--seed 117`（与 `refusal_prescreen_seed` 一致，`optimization.sampler_seed` 未设时继承全局 seed，TPE 探索轨迹随之固定）；config 删除无效的 `seed = 117` 行。另：交互模式由"不传 `--non-interactive`"实现（默认 False），TOML 里的 `non_interactive` 键本身无效。
+- **涉及**: `run_lfm2.5.sh`, `configs/lfm2.5_2.6b_rocm.toml`
+- **与上游关系**: 仅 fork（机台脚本 + 配方）；上游若想修 TOML 顶层字段失效需另查 pydantic-settings 配置
+
 ### 2026-08-05 — feat: 单卡 BF16 快速加载（绕开 accelerate 逐张量 H2D copy）
 
 - **类型**: perf（引擎加载路径）

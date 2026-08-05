@@ -61,7 +61,7 @@ print_responses = false
 print_residual_geometry = false
 plot_residuals = false
 
-non_interactive = true
+non_interactive = false
 overwrite_checkpoint = true
 system_prompt = "You are a helpful assistant."
 
