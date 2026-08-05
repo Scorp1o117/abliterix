@@ -105,6 +105,7 @@
 | `configs/laguna_s_2.1_rocm_bnb4bit.toml` | Laguna-S-2.1 ROCm bnb4bit |
 | `configs/agents_a1_*.toml` | Agents-A1 相关 |
 | `configs/qwen_agentworld_35b_a3b_rocm_bnb4bit.toml` | Qwen AgentWorld |
+| `configs/lfm2.5_2.6b_rocm*.toml`, `run_lfm2.5.sh` | LFM2.5-2.6B ROCm 冒烟/完整搜索 |
 | `docs/qwen35moe-rocm-bnb4bit-changes.md` | Qwen3.5 MoE 变更说明 |
 | `LAGUNA_PROJECT_HANDOVER.md` | Laguna 项目交接 |
 | `diag_*.py`, `run-agents-a1.sh` | 诊断 / 运行辅助 |
@@ -142,6 +143,13 @@
 ```
 
 ---
+
+### 2026-08-05 — LFM2.5-2.6B (LiquidAI) ROCm 配方 + 运行脚本
+
+- **类型**: feat / chore
+- **摘要**: 新增 LFM2.5-2.6B（混合 22 短卷积块 + 8 GQA 注意力）abliteration 配方：`configs/lfm2.5_2.6b_rocm.toml`（60 trials 完整搜索）与 `configs/lfm2.5_2.6b_rocm_smoke.toml`（8 trials 冒烟验证）；新增 `run_lfm2.5.sh` 运行脚本（含 `unset PYTHONPATH` 防 Hermes venv 泄漏）。已验证引擎 `steerable_modules()` 原生注册 LFM2 三个投影点（`conv.out_proj` → attn.o_proj、`self_attn.out_proj` → attn.o_proj、`feed_forward.w2` → mlp.down_proj），无需改引擎代码。筛查 flag（prescreen/validation KL/generation health/thinking leak）全开，配方沿用 agents_a1_full 风格。模型权重放 `/run/media/s117/OS/Models/LFM2.5-2.6B`（BF16，~5.4GB，无量化）。
+- **涉及**: `configs/lfm2.5_2.6b_rocm.toml`, `configs/lfm2.5_2.6b_rocm_smoke.toml`, `run_lfm2.5.sh`
+- **与上游关系**: 仅 fork（机台配方）
 
 ### 2026-07-30 — PR #95 empty-adapter guard + 作者第三轮补丁
 
