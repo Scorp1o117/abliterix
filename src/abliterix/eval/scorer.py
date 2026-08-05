@@ -283,6 +283,10 @@ class TrialScorer:
             )
         if not hasattr(self, "baseline_continuations"):
             self.baseline_continuations = None
+        if not hasattr(self, "baseline_continuation_nll"):
+            # Branches that compute logprob scoring (HF backend with
+            # kl.token_count > 1, non-continuation-NLL vLLM paths) never set
+            # the NLL attribute; the cache save below requires it to exist.
             self.baseline_continuation_nll = None
         base_lengths = [len(r.split()) for r in base_responses]
         self.baseline_mean_length = (

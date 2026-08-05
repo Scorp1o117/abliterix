@@ -144,6 +144,13 @@
 
 ---
 
+### 2026-08-05 — fix: baseline cache save 缺 baseline_continuation_nll 属性
+
+- **类型**: fix（仅 fork 缓存代码）
+- **摘要**: `_capture_baseline` 的 HF 后端 + `kl.token_count > 1` 分支只设 `baseline_continuations`，不设 `baseline_continuation_nll`；末尾 `hasattr("baseline_continuations")` 保护因此跳过初始化，`_save_baseline_cache` 存缓存时 AttributeError 崩溃（LFM2.5-2.6B smoke 实测触发）。改为对两个属性分别做 `hasattr` 初始化。上游 master 无此崩溃点（`_save_baseline_cache` 为 fork 独有，上游读该属性处均有 getattr 保护）。
+- **涉及**: `src/abliterix/eval/scorer.py`
+- **与上游关系**: 仅 fork；如上游化缓存功能需一并带上
+
 ### 2026-08-05 — LFM2.5-2.6B (LiquidAI) ROCm 配方 + 运行脚本
 
 - **类型**: feat / chore
