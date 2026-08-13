@@ -36,8 +36,9 @@ v6 t21 can export.
 upstream. `logs/` and `checkpoints_ling30_*` stay untracked.
 
 **Upstream PRs (separate `pr/*` from `upstream/master`, not this
-branch):** Bailing steerable discovery; MoE router dtype + bincount.
-Do not fold those into #95.
+branch, not #95):**
+- #103 `pr/bailing-steerable-modules` — Bailing `layer.attention` discovery
+- #104 `pr/moe-router-profiling` — router dtype probe + bincount
 
 Follow-up commit on this branch adds the frozen v6 recipe, merge
 script, project logs, and the remaining Ling lab configs/runners.
