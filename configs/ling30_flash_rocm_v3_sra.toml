@@ -1,0 +1,131 @@
+# Ling-3.0-flash v3 — SRA direction + no expert routing + mild strength
+#
+# v2 post-mortem (25 trials, Laguna-style o_proj+down_proj+expert):
+#   - Low refusal IS achievable (prescreen 2–8/30) but EVERY such trial
+#     is KL-pruned (threshold 0.5). Best finite: KL 0.40–0.47 @ 30–57% refuse.
+#   - Same KL floor as pure-down_proj v1 → o_proj/expert did not open a
+#     low-KL basin. Safety-expert risk scores are weak/diffuse (top ~0.05–0.13).
+#   - Conclusion: mean-diff direction is entangled with capability on Ling;
+#     more strength only trades refusal for KL. Need a CLEANER direction.
+#
+# v3 pivot:
+#   1. vector_method = sra  (Surgical Refusal Ablation — spectral residualise
+#      mean-diff against benign capability concept atoms; arxiv:2601.08489)
+#   2. Expert routing OFF (max_suppress=0) — weak safety ranking + high damage
+#   3. Milder strength band [0.3, 2.5] (v2 [1.5, 6] only found high-KL region)
+#   4. auto-disable down_proj so TPE can try o_proj-only sparse edits
+#   5. search_harmfulness_direction — dual refusal+harmfulness pair as option
+#   6. weight_normalization=pre, discriminative layers, residuals recomputed
+#
+# Acceptance: KL ≤ 0.05 AND refusal ≤ 10/100.
+
+system_prompt = "You are a helpful assistant."
+
+[model]
+model_id = "/run/media/s117/OS/Models/Ling-3.0-flash"
+dtype_fallback_order = ["float16"]
+quant_method = "bnb_4bit"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "104GB", "cpu" = "16GB"}
+trust_remote_code = true
+
+[inference]
+batch_size = 1
+min_batch_size = 1
+max_batch_size = 1
+skip_common_response_prefix = true
+max_gen_tokens = 160
+
+[steering]
+# --- direction quality (the pivot) ---
+vector_method = "sra"
+sra_base_method = "mean"
+sra_n_atoms = 16
+sra_ridge_alpha = 0.01
+search_harmfulness_direction = true
+
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.99
+weight_normalization = "pre"
+discriminative_layer_selection = true
+decay_kernel = "gaussian"
+
+# Mild band: v2 never saw a useful point above ~2.5 without KL explosion
+strength_range = [0.3, 2.5]
+
+disabled_components = [
+  "attn.q_proj",
+  "attn.k_proj",
+  "attn.v_proj",
+  "attn.q_b_proj",
+  "attn.kv_b_proj",
+]
+
+# Allow TPE to fully disable down_proj (negative floor → clamp to 0)
+auto_disable_components = ["mlp.down_proj"]
+auto_disable_floor = -0.5
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [0.3, 2.5]
+"mlp.down_proj" = [0.3, 2.5]
+
+[experts]
+# Off: v1/v2 expert ops either raised refusal or only helped with high KL.
+max_suppress = 0
+router_bias_range = [0.0, 0.0]
+ablation_weight_range = [0.0, 0.0]
+
+[optimization]
+# Probe budget: 10 trials only. If Pareto not near KL≤0.05 & ref≤10%, pivot again.
+num_trials = 10
+num_warmup_trials = 4
+checkpoint_dir = "checkpoints_ling30_flash_v3_sra"
+
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 30
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.005
+# Slightly looser prune so mild-strength SRA points are observed (still
+# far above the 0.05 acceptance line; low-refusal INF in v2 had KL>>0.5).
+prune_threshold = 0.6
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = true
+plot_residuals = false
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

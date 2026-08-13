@@ -1,0 +1,45 @@
+#!/bin/bash
+# Ling-3.0-flash v36: fresh canonical baseline + canonical steered full eval
+
+set -euo pipefail
+cd "$(dirname "$0")"
+ulimit -n 65536 || ulimit -n 8192 || true
+export TRANSFORMERS_SKIP_ALLOCATOR_WARMUP=1
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+unset PYTHONPATH AX_NON_INTERACTIVE
+# shellcheck source=/dev/null
+source /home/s117/heretic-env/bin/activate
+
+CONFIG="configs/ling30_flash_rocm_v30_global_strength.toml"
+CKPT="checkpoints_ling30_flash_v36_matched_canonical_full"
+mkdir -p "$CKPT" logs
+
+# Baseline is deliberately NOT copied: v36 must capture canonical baseline
+# continuations and logprobs under the same batch membership as steered KL.
+for suffix in _steering.pt _generated_gate_responses.pt; do
+  for f in checkpoints_ling30_flash_v35_canonical_full/*"$suffix"; do
+    [[ -f "$f" ]] || continue
+    bn=$(basename "$f")
+    [[ -f "$CKPT/$bn" ]] || cp -f "$f" "$CKPT/$bn"
+  done
+done
+
+V36_OPTIMIZATION_JSON='{"num_trials":1,"num_warmup_trials":1,"checkpoint_dir":"checkpoints_ling30_flash_v36_matched_canonical_full","refusal_prescreen_enabled":true,"refusal_prescreen_size":60,"refusal_prescreen_pass_max":60,"refusal_prescreen_prune_min":61,"refusal_prescreen_seed":117,"prescreen_reverse_order_replay":false,"validation_kl_enabled":true,"validation_kl_size":30,"generation_health_enabled":true,"thinking_leak_detection_enabled":true,"seed_trials":[{"vector_scope":"per layer","vector_index":30.25491805410134,"attn.o_proj.max_weight":1.20,"attn.o_proj.max_weight_position":38.01626146913563,"attn.o_proj.min_weight":0.3145186120734486,"attn.o_proj.min_weight_distance":18.562455387145544}]}'
+
+echo "=== Ling-3.0-flash v36 MATCHED CANONICAL FULL EVAL ==="
+echo "  baseline: fresh canonical batch16 capture"
+echo "  steered: canonical gate cache + identical canonical batch membership"
+echo "  evaluation: matched primary KL + full harmful + validation KL + health"
+
+exec abliterix \
+  --config "$CONFIG" \
+  --seed 117 \
+  --optimization "$V36_OPTIMIZATION_JSON" \
+  --steering.concept-gate-global-single-sample-prepass \
+  --steering.concept-gate-global-canonical-batching \
+  --inference.batch-size 16 \
+  --inference.min-batch-size 16 \
+  --inference.max-batch-size 16 \
+  --non-interactive \
+  --overwrite-checkpoint \
+  "$@"

@@ -1,0 +1,135 @@
+# Ling-3.0-flash v9 — data-driven optimal SEARCH (not export)
+#
+# Evidence synthesis (v1–v8):
+#   ✗ weight_norm=none (v1/v8): finite KL~0.09 but refuse 40–55%  OR KL~0.45
+#   ✗ SRA / expert routing / cliff-head: no dual progress
+#   ✗ light o_proj-only / auto-disable down=0: 28–30/30 prescreen death
+#   ✓ weight_normalization=full + rank3 (MPOA write): ONLY low-KL basin on Ling
+#   ✓ o_proj + down_proj both ON, per-layer vectors
+#   ✓ v6 Pareto best dual-ish:
+#       t21 KL=0.093 ref=17%  o_mw=2.40 d_mw=1.94  pos~35–36
+#       t15 KL=0.094 ref=19%  o_mw=2.41 d_mw=1.66  pos~35–36
+#       low-refuse cluster sits at TOP of v6 band [0.8,2.5] → need higher ceiling
+#
+# v9 search design (push dual KL≤0.05 & ref≤10%):
+#   1. Keep MPOA full+r3 (method that works, not ideology)
+#   2. fixed_vector_scope = per layer (all finite hits)
+#   3. Center strength on winners, RAISE ceiling past v6 cap:
+#        o_proj ∈ [2.0, 2.9]   d ∈ [1.5, 2.7]
+#   4. auto_disable_components = []  (never zero down)
+#   5. min_weight_frac_max = 0.50  (peaky mid/late like winners)
+#   6. projected + orthogonal + winsorize (v4–v6 productive stack)
+#   7. No cliff / SRA / experts / harmfulness pair
+#   8. batch=16, 60 trials, TPE warmup 15
+#
+# Goal (selection): KL ≤ 0.05 AND refusals ≤ 10/100
+
+system_prompt = "You are a helpful assistant."
+
+[model]
+model_id = "/run/media/s117/OS/Models/Ling-3.0-flash"
+dtype_fallback_order = ["float16"]
+quant_method = "bnb_4bit"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "104GB", "cpu" = "16GB"}
+trust_remote_code = true
+
+[inference]
+batch_size = 16
+min_batch_size = 16
+max_batch_size = 16
+skip_common_response_prefix = true
+max_gen_tokens = 160
+
+[steering]
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "full"
+full_norm_lora_rank = 3
+discriminative_layer_selection = false
+search_harmfulness_direction = false
+cliff_head_ablation = false
+
+# All productive finite trials were per-layer; global = waste.
+fixed_vector_scope = "per layer"
+
+# Fallback global band (components override below)
+strength_range = [1.8, 2.9]
+
+auto_disable_components = []
+min_weight_frac_max = 0.50
+
+disabled_components = [
+  "attn.q_proj",
+  "attn.k_proj",
+  "attn.v_proj",
+  "attn.q_b_proj",
+  "attn.kv_b_proj",
+]
+
+[steering.component_strength_ranges]
+# Centered on v6 dual-ish winners (o~2.3–2.5, d~1.7–2.5); ceiling above 2.5
+# so TPE can push refuse from ~17% toward 10% without saturating the range.
+"attn.o_proj" = [2.00, 2.90]
+"mlp.down_proj" = [1.50, 2.70]
+
+[experts]
+max_suppress = 0
+router_bias_range = [0.0, 0.0]
+ablation_weight_range = [0.0, 0.0]
+
+[optimization]
+num_trials = 60
+num_warmup_trials = 15
+checkpoint_dir = "checkpoints_ling30_flash_v9_optimal"
+
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+# Let borderline (incl. ~10–18/30 ≈ 33–60% refuse) reach full KL more often
+refusal_prescreen_pass_max = 12
+refusal_prescreen_prune_min = 20
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 30
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01
+# Allow seeing mid-KL tradeoffs; selection still ranks toward 0.05
+prune_threshold = 0.7
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

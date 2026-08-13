@@ -39,6 +39,9 @@ upstream. `logs/` and `checkpoints_ling30_*` stay untracked.
 branch):** Bailing steerable discovery; MoE router dtype + bincount.
 Do not fold those into #95.
 
+Follow-up commit on this branch adds the frozen v6 recipe, merge
+script, project logs, and the remaining Ling lab configs/runners.
+
 ---
 
 ## 0b. 2026-08-12 — Ling rank-k angular runtime support / v41 probe

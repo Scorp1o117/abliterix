@@ -1,0 +1,106 @@
+# Ling-3.0-flash v4 — Ornith classic (MPOA) recipe, batch=16
+#
+# Ornith local Pareto: t62 KL=0.028 ref=11; t61 KL=0.049 ref=11.
+# Ling batch8 already found low-KL basin (KL 0.034–0.062).
+# Fresh study with batch=16 for speed; interactive TUI for add-trials/export.
+#
+# Goal: KL ≤ 0.05 and refusal ≤ 10/100.
+
+system_prompt = "You are a helpful assistant."
+
+[model]
+model_id = "/run/media/s117/OS/Models/Ling-3.0-flash"
+dtype_fallback_order = ["float16"]
+quant_method = "bnb_4bit"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "104GB", "cpu" = "16GB"}
+trust_remote_code = true
+
+[inference]
+batch_size = 16
+min_batch_size = 16
+max_batch_size = 16
+skip_common_response_prefix = true
+max_gen_tokens = 160
+
+[steering]
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "full"
+full_norm_lora_rank = 3
+discriminative_layer_selection = false
+search_harmfulness_direction = false
+
+strength_range = [0.5, 2.1]
+
+disabled_components = [
+  "attn.q_proj",
+  "attn.k_proj",
+  "attn.v_proj",
+  "attn.q_b_proj",
+  "attn.kv_b_proj",
+]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [0.5, 2.1]
+"mlp.down_proj" = [0.5, 2.1]
+
+[experts]
+max_suppress = 0
+router_bias_range = [0.0, 0.0]
+ablation_weight_range = [0.0, 0.0]
+
+[optimization]
+# Room to add more trials from the TUI without a new study.
+num_trials = 30
+num_warmup_trials = 8
+checkpoint_dir = "checkpoints_ling30_flash_v4_b16"
+
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 30
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01
+prune_threshold = 0.6
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = true
+print_residual_geometry = false
+plot_residuals = false
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

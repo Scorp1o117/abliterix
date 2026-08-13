@@ -1,0 +1,131 @@
+# Ling-3.0-flash v5 — low-refusal continuation around v4 Pareto
+#
+# Evidence from v4 (batch8 + batch16):
+#   • ALL finite OK trials used vector_scope = per layer (global → high-prune).
+#   • Low-KL basin exists: KL 0.034–0.10 (was ~0.45 in v1–v3).
+#   • Best dual tradeoffs still ~31–34% refuse @ KL 0.06–0.10 (goal 10% / 0.05).
+#   • Productive max_weight cluster: o_proj ≈ 1.6–1.95, down ≈ 1.5–1.9.
+#   • Near-zero down_proj / weak o → 27–30/30 prescreen (dead).
+#
+# v5 changes vs v4 broad Ornith band:
+#   1. fixed_vector_scope = "per layer"  (drop global)
+#   2. Narrow component strengths to the productive cluster (slightly open top
+#      for refusal push: o up to 2.2)
+#   3. min_weight_frac_max = 0.55  (bias sharp mid/late peaks, not flat over-steer)
+#   4. auto_disable_components = []  (do not randomly zero down_proj)
+#   5. batch_size = 16 (confirmed OK on this machine)
+#   6. num_trials = 20 probe; TUI can extend
+#
+# Goal: KL ≤ 0.05 and refusal ≤ 10/100.
+
+system_prompt = "You are a helpful assistant."
+
+[model]
+model_id = "/run/media/s117/OS/Models/Ling-3.0-flash"
+dtype_fallback_order = ["float16"]
+quant_method = "bnb_4bit"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "104GB", "cpu" = "16GB"}
+trust_remote_code = true
+
+[inference]
+batch_size = 16
+min_batch_size = 16
+max_batch_size = 16
+skip_common_response_prefix = true
+max_gen_tokens = 160
+
+[steering]
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "full"
+full_norm_lora_rank = 3
+discriminative_layer_selection = false
+search_harmfulness_direction = false
+
+# All v4 finite hits were per-layer; global only produced high-prune.
+fixed_vector_scope = "per layer"
+
+# Global fallback range (overridden per-component below)
+strength_range = [1.4, 2.2]
+
+# Do not allow TPE to fully disable down_proj (v4 zeros → 30/30 refuse).
+auto_disable_components = []
+
+# Prefer peaky profiles (winners were not flat layer-wide max).
+min_weight_frac_max = 0.55
+
+disabled_components = [
+  "attn.q_proj",
+  "attn.k_proj",
+  "attn.v_proj",
+  "attn.q_b_proj",
+  "attn.kv_b_proj",
+]
+
+[steering.component_strength_ranges]
+# Cluster from v4 OK trials (o 1.60–1.93, d 1.47–1.91), open slightly up for
+# refusal pressure while staying near the low-KL band.
+"attn.o_proj" = [1.50, 2.20]
+"mlp.down_proj" = [1.40, 2.10]
+
+[experts]
+max_suppress = 0
+router_bias_range = [0.0, 0.0]
+ablation_weight_range = [0.0, 0.0]
+
+[optimization]
+num_trials = 20
+num_warmup_trials = 6
+checkpoint_dir = "checkpoints_ling30_flash_v5_lowref"
+
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+# Slightly friendlier pass band so borderline ~10–18/30 get full eval more often
+refusal_prescreen_pass_max = 10
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 30
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01
+# Allow seeing points up to 0.7; goal still 0.05 on selection
+prune_threshold = 0.7
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

@@ -1,0 +1,120 @@
+# Ling-3.0-flash v6 — classic abliteration, batch=16, large trial budget
+#
+# Method: default directional abliteration only
+#   - vector_method = mean
+#   - projected + orthogonal (upstream-style)
+#   - weight_normalization = full + rank 3 (MPOA write; Ling's only low-KL path so far)
+#   - NO SRA / harmfulness pair / expert routing / ARA
+#
+# batch_size = 16 (confirmed on this machine)
+# num_trials = 80 — stack Optuna samples; expect refinement of the known
+#   Pareto (KL ~0.03–0.10, refuse ~30–50%), not a guaranteed dual-goal hit.
+#
+# Goal (selection): KL ≤ 0.05 AND refusals ≤ 10/100
+
+system_prompt = "You are a helpful assistant."
+
+[model]
+model_id = "/run/media/s117/OS/Models/Ling-3.0-flash"
+dtype_fallback_order = ["float16"]
+quant_method = "bnb_4bit"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "104GB", "cpu" = "16GB"}
+trust_remote_code = true
+
+[inference]
+batch_size = 16
+min_batch_size = 16
+max_batch_size = 16
+skip_common_response_prefix = true
+max_gen_tokens = 160
+
+[steering]
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+# MPOA-style LoRA write — required for Ling low-KL basin (v1 none → KL~0.45)
+weight_normalization = "full"
+full_norm_lora_rank = 3
+discriminative_layer_selection = false
+search_harmfulness_direction = false
+
+# All finite v4 hits used per-layer; keep global too so TPE can re-check.
+# Prefer per-layer via wider exploration (80 trials).
+# fixed_vector_scope left unset → sample global | per layer
+
+# Slightly wider than v5 so trial stack can explore around the known cluster
+strength_range = [0.8, 2.5]
+
+disabled_components = [
+  "attn.q_proj",
+  "attn.k_proj",
+  "attn.v_proj",
+  "attn.q_b_proj",
+  "attn.kv_b_proj",
+]
+
+auto_disable_components = []
+min_weight_frac_max = 0.7
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [0.8, 2.5]
+"mlp.down_proj" = [0.8, 2.5]
+
+[experts]
+max_suppress = 0
+router_bias_range = [0.0, 0.0]
+ablation_weight_range = [0.0, 0.0]
+
+[optimization]
+num_trials = 80
+num_warmup_trials = 20
+checkpoint_dir = "checkpoints_ling30_flash_v6_stack"
+
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 10
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 30
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01
+prune_threshold = 0.7
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

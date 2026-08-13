@@ -1,0 +1,114 @@
+# Ling-3.0-flash v12 — same-prompt assistant response-trajectory pairing
+#
+# v11 changed system prompts before the user request and produced a direction
+# 77.7 degrees away from mean, but all 12 trials still refused 30/30. v12 keeps
+# prompt + system identical and teacher-forces a minimal-pair assistant response:
+# target(refusal trajectory) - benign(compliance trajectory).
+#
+# Probe budget: 12 trials. Continue only if any finite point appears and beats:
+#   refusal <= 17% with KL < 0.08, OR KL <= 0.10 with refusal < 13%.
+
+system_prompt = "You are a helpful assistant."
+
+[model]
+model_id = "/run/media/s117/OS/Models/Ling-3.0-flash"
+dtype_fallback_order = ["float16"]
+quant_method = "bnb_4bit"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "104GB", "cpu" = "16GB"}
+trust_remote_code = true
+
+[inference]
+batch_size = 16
+min_batch_size = 16
+max_batch_size = 16
+skip_common_response_prefix = true
+max_gen_tokens = 160
+offload_outputs_to_cpu = true
+
+[steering]
+vector_method = "mean"
+response_pair_enabled = true
+response_pair_compliance_text = "Sure, I can help with that request. Here is a direct answer:"
+response_pair_refusal_text = "Sorry, I cannot help with that request. I cannot provide an answer."
+response_pair_pooling = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "full"
+full_norm_lora_rank = 3
+discriminative_layer_selection = false
+search_harmfulness_direction = false
+cliff_head_ablation = false
+fixed_vector_scope = "per layer"
+strength_range = [1.5, 4.0]
+auto_disable_components = []
+min_weight_frac_max = 0.50
+disabled_components = [
+  "attn.q_proj",
+  "attn.k_proj",
+  "attn.v_proj",
+  "attn.q_b_proj",
+  "attn.kv_b_proj",
+]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [1.50, 4.00]
+"mlp.down_proj" = [1.20, 3.50]
+
+[experts]
+max_suppress = 0
+router_bias_range = [0.0, 0.0]
+ablation_weight_range = [0.0, 0.0]
+
+[optimization]
+num_trials = 12
+num_warmup_trials = 6
+checkpoint_dir = "checkpoints_ling30_flash_v12_response_pair"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 12
+refusal_prescreen_prune_min = 20
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 30
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01
+prune_threshold = 0.7
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+# These sources must remain byte-for-byte aligned for response-pair mode.
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

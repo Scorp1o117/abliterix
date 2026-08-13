@@ -1,0 +1,116 @@
+# Ling-3.0-flash v16 — learned harmful-state gate at the proven block-output site
+#
+# Exact v13 t2 angular profile, but a token is edited only when both conditions
+# hold: its per-layer ConceptScorer score passes the trial threshold and its
+# projection onto the refusal direction is positive. Stop after each matched
+# fixed 30-prompt prescreen.
+
+system_prompt = "You are a helpful assistant."
+
+[model]
+model_id = "/run/media/s117/OS/Models/Ling-3.0-flash"
+dtype_fallback_order = ["float16"]
+quant_method = "bnb_4bit"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "104GB", "cpu" = "16GB"}
+trust_remote_code = true
+
+[inference]
+batch_size = 16
+min_batch_size = 16
+max_batch_size = 16
+skip_common_response_prefix = true
+max_gen_tokens = 160
+offload_outputs_to_cpu = true
+
+[steering]
+vector_method = "mean"
+steering_mode = "concept_gated_angular"
+runtime_hook_site = "decoder_block"
+search_runtime_hook_site = false
+concept_gate_threshold = 0.3
+search_concept_gate_threshold = true
+concept_gate_threshold_range = [0.05, 0.30]
+svf_scorer_epochs = 20
+svf_scorer_lr = 0.001
+svf_scorer_hidden = 128
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+discriminative_layer_selection = false
+fixed_vector_scope = "per layer"
+strength_range = [0.95, 1.00]
+min_weight_frac_max = 0.35
+auto_disable_components = []
+disabled_components = [
+  "attn.q_proj",
+  "attn.k_proj",
+  "attn.v_proj",
+  "attn.q_b_proj",
+  "attn.kv_b_proj",
+  "mlp.down_proj",
+]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [0.95, 1.00]
+
+[experts]
+max_suppress = 0
+router_bias_range = [0.0, 0.0]
+ablation_weight_range = [0.0, 0.0]
+
+[optimization]
+num_trials = 3
+num_warmup_trials = 3
+checkpoint_dir = "checkpoints_ling30_flash_v16_concept_gate"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+# Diagnostic-only: terminate immediately after recording refusal and gate rate.
+refusal_prescreen_pass_max = 0
+refusal_prescreen_prune_min = 0
+refusal_prescreen_seed = 117
+validation_kl_enabled = false
+generation_health_enabled = false
+thinking_leak_detection_enabled = false
+seed_trials = [
+  { concept_gate_threshold = 0.05, vector_scope = "per layer", vector_index = 30.25491805410134, "attn.o_proj.max_weight" = 0.9698154112336964, "attn.o_proj.max_weight_position" = 38.01626146913563, "attn.o_proj.min_weight" = 0.3145186120734486, "attn.o_proj.min_weight_distance" = 18.562455387145544 },
+  { concept_gate_threshold = 0.15, vector_scope = "per layer", vector_index = 30.25491805410134, "attn.o_proj.max_weight" = 0.9698154112336964, "attn.o_proj.max_weight_position" = 38.01626146913563, "attn.o_proj.min_weight" = 0.3145186120734486, "attn.o_proj.min_weight_distance" = 18.562455387145544 },
+  { concept_gate_threshold = 0.30, vector_scope = "per layer", vector_index = 30.25491805410134, "attn.o_proj.max_weight" = 0.9698154112336964, "attn.o_proj.max_weight_position" = 38.01626146913563, "attn.o_proj.min_weight" = 0.3145186120734486, "attn.o_proj.min_weight_distance" = 18.562455387145544 },
+]
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01
+prune_threshold = 0.70
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

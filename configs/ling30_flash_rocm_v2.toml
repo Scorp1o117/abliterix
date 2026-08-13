@@ -1,0 +1,124 @@
+# Ling-3.0-flash v2 — fix Bailing hybrid steerable discovery + Laguna-style search
+#
+# Root cause of v1 failure (debug runs 2026-08-07):
+#   BailingMoeV3DecoderLayer uses layer.attention (not self_attn), and MLA
+#   output is ``dense`` not ``o_proj``. steerable_modules only found
+#   mlp.down_proj → pure LoRA down_proj seesaw (KL 0.46 @ 43% refuse).
+# engine.py now registers attention.o_proj / attention.dense as attn.o_proj.
+#
+# Recipe mirrors Laguna-S-2.1 winners (KL 0.002–0.01, refuse 7–9/100):
+#   attn.o_proj + mlp.down_proj + expert suppress/ablation, gaussian decay,
+#   discriminative layers, moderate strength, routing enabled.
+#
+# Acceptance: KL ≤ 0.05 AND refusal ≤ 10/100.
+# Hardware: ROCm Strix Halo, bnb4bit, batch_size MUST stay 1 (MoE ulp bug).
+
+seed = 117
+system_prompt = "You are a helpful assistant."
+non_interactive = true
+overwrite_checkpoint = true
+
+[model]
+model_id = "/run/media/s117/OS/Models/Ling-3.0-flash"
+dtype_fallback_order = ["float16"]
+quant_method = "bnb_4bit"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "104GB", "cpu" = "16GB"}
+trust_remote_code = true
+
+[inference]
+# batch>1 prefill differs by ~1 ulp; 40-layer MoE router amplifies to
+# degenerate output. Verified — do not raise.
+batch_size = 1
+min_batch_size = 1
+max_batch_size = 1
+skip_common_response_prefix = true
+# Part of baseline cache key; keep 160 to reuse existing baseline.pt if present.
+max_gen_tokens = 160
+
+[steering]
+vector_method = "mean"
+decay_kernel = "gaussian"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "none"
+discriminative_layer_selection = true
+
+# Laguna used [0.5, 6.0]; Ling v1 [2,10] blew KL, [0.5,4] was only down_proj.
+# With o_proj restored, open slightly like Laguna.
+strength_range = [0.5, 6.0]
+
+# Skip Q/K/V (and MLA q_b/kv_b if discovered) — Laguna/Qwen MoE proven path.
+disabled_components = [
+  "attn.q_proj",
+  "attn.k_proj",
+  "attn.v_proj",
+  "attn.q_b_proj",
+  "attn.kv_b_proj",
+]
+
+[steering.component_strength_ranges]
+# Laguna winners sat around down 2.3–5.4 / o 3.5–5.6
+"mlp.down_proj" = [1.5, 6.0]
+"attn.o_proj" = [1.0, 6.0]
+
+[experts]
+# v1 routing-only without o_proj correlated with HIGHER refusals.
+# With o_proj fixed, re-enable Laguna-like expert ops (512 experts; cap
+# suppress below Laguna's 20 absolute count → still a small fraction).
+max_suppress = 24
+router_bias_range = [-12.0, 0.0]
+ablation_weight_range = [0.0, 8.0]
+
+[optimization]
+num_trials = 40
+num_warmup_trials = 10
+checkpoint_dir = "checkpoints_ling30_flash_v2"
+
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 30
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.005
+# Acceptable ceiling for early prune; goal remains KL ≤ 0.05 on full eval.
+prune_threshold = 0.5
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

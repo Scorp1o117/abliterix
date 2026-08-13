@@ -1,0 +1,104 @@
+# Ling-3.0-flash DEBUG variant: prints every model response so trial
+# quality (refusals, degeneration, thinking leaks) is directly visible.
+# Small trial budget for fast iteration. Same model/steering as smoke.
+
+[model]
+model_id = "/run/media/s117/OS/Models/Ling-3.0-flash"
+dtype_fallback_order = ["float16"]
+quant_method = "bnb_4bit"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "104GB", "cpu" = "16GB"}
+trust_remote_code = true
+
+[inference]
+# batch_size MUST be 1: batch>1 prefill differs from single-sample by
+# ~1 ulp (fp kernel reduce order); the 40-layer MoE router amplifies this
+# to degenerate output (echo / "33.12.1.1..." repetition). Verified
+# across fused_recurrent / chunk / eager attention. Single-sample is clean.
+batch_size = 1
+min_batch_size = 1
+max_batch_size = 1
+skip_common_response_prefix = true
+# NOTE: keep max_gen_tokens=160 — it is part of the baseline cache key;
+# lowering it would invalidate the cached baseline (~60 min recompute).
+max_gen_tokens = 160
+
+[steering]
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "none"
+# SC117: Ling is a 512-expert MoE — TPE sampling [2,10] produced max_weight
+# ~8.8 → KL 3.92 nats/token (prune threshold 0.5): far too strong. Narrow to
+# a temperate band like Laguna ([0.5, 6.0]) / gemma4_e4b ([0.5, 4.0]).
+strength_range = [0.5, 4.0]
+disabled_components = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
+
+[steering.component_strength_ranges]
+"mlp.down_proj" = [0.5, 4.0]
+"attn.o_proj" = [0.5, 3.0]
+
+[experts]
+# SC117: 2026-08-07 finding — expert routing ops correlate strongly with
+# HIGHER refusal rates (27-28/30 prescreen prunes while KL dropped).
+# Disable routing entirely; pure LoRA steering only, to verify refusal
+# rate actually comes down.
+max_suppress = 0
+router_bias_range = [0.0, 0.0]
+ablation_weight_range = [0.0, 0.0]
+
+[optimization]
+num_trials = 20
+num_warmup_trials = 3
+checkpoint_dir = "checkpoints_ling30_flash_debug"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 30
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.005
+prune_threshold = 0.5
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = true
+overwrite_checkpoint = true
+system_prompt = "You are a helpful assistant."
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"
