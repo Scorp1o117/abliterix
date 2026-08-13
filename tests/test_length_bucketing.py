@@ -129,6 +129,17 @@ def test_generate_text_batched_sorts_stably_by_rendered_token_length_and_restore
     ]
 
 
+def test_length_sorting_has_content_tiebreaker_independent_of_input_order():
+    engine, _model = _engine()
+    forward = engine._length_sorted_indices(_messages())
+    reversed_messages = list(reversed(_messages()))
+    reverse = engine._length_sorted_indices(reversed_messages)
+
+    forward_users = [_messages()[index].user for index in forward]
+    reverse_users = [reversed_messages[index].user for index in reverse]
+    assert forward_users == reverse_users == ["alpha", "charlie", "b", "dd"]
+
+
 def test_generate_text_batched_keeps_original_batch_order_by_default():
     engine, model = _engine()
 

@@ -250,7 +250,6 @@ def test_multi_direction_moe_rejection_happens_before_lora_commit(abliterix_conf
 @pytest.mark.parametrize(
     "mode",
     [
-        SteeringMode.ANGULAR,
         SteeringMode.ADAPTIVE_ANGULAR,
         SteeringMode.SPHERICAL,
         SteeringMode.VECTOR_FIELD,

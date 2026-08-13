@@ -39,6 +39,7 @@ class SteeringMode(str, Enum):
     LORA = "lora"
     ANGULAR = "angular"
     ADAPTIVE_ANGULAR = "adaptive_angular"
+    CONCEPT_GATED_ANGULAR = "concept_gated_angular"
     SPHERICAL = "spherical"
     VECTOR_FIELD = "vector_field"
     DIRECT = "direct"

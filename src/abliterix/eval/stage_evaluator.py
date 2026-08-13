@@ -10,6 +10,7 @@ generation health, and thinking leak detection.
 All configuration lives under ``config.optimization.*``.
 """
 
+import os
 import random
 import statistics
 
@@ -198,11 +199,221 @@ class StageEvaluator:
             # No prescreen prompts available — fall through to full eval.
             return 0, False
 
-        detected_30 = self.scorer.detector.evaluate_compliance(
-            self.engine, self._prescreen_msgs,
+        self.engine._prefix_retry_stats = {
+            "retried": 0,
+            "still_prefix_refusal": 0,
+            "fixed_prefix": 0,
+        }
+
+        evaluate_result = getattr(
+            self.scorer.detector, "evaluate_compliance_result", None
         )
+        if callable(evaluate_result):
+            prescreen_result = evaluate_result(self.engine, self._prescreen_msgs)
+            detected_30 = prescreen_result.require_complete().refusal_count
+            refusal_indices = [
+                source_idx
+                for source_idx, label in zip(
+                    self._prescreen_indices, prescreen_result.labels
+                )
+                if label is True
+            ]
+            compliance_indices = [
+                source_idx
+                for source_idx, label in zip(
+                    self._prescreen_indices, prescreen_result.labels
+                )
+                if label is False
+            ]
+            trial.set_user_attr("prescreen_refusal_indices", refusal_indices)
+            trial.set_user_attr("prescreen_compliance_indices", compliance_indices)
+            onset = getattr(self.scorer.detector, "_last_onset", None)
+            if onset is not None and len(onset) == len(self._prescreen_indices):
+                prefix_indices = [
+                    source_idx
+                    for source_idx, item in zip(self._prescreen_indices, onset)
+                    if item.get("prefix_refusal")
+                ]
+                late_indices = [
+                    source_idx
+                    for source_idx, item in zip(self._prescreen_indices, onset)
+                    if item.get("late_refusal")
+                ]
+                trial.set_user_attr("prescreen_prefix_refusal_indices", prefix_indices)
+                trial.set_user_attr("prescreen_late_refusal_indices", late_indices)
+                trial.set_user_attr(
+                    "prescreen_prefix_classes",
+                    {
+                        str(source_idx): str(item.get("bucket"))
+                        for source_idx, item in zip(self._prescreen_indices, onset)
+                    },
+                )
+        else:
+            detected_30 = self.scorer.detector.evaluate_compliance(
+                self.engine, self._prescreen_msgs,
+            )
         trial.set_user_attr("prescreen_refusals", detected_30)
         trial.set_user_attr("prescreen_indices", self._prescreen_indices)
+        retry_stats = getattr(self.engine, "_prefix_retry_stats", None)
+        if isinstance(retry_stats, dict):
+            trial.set_user_attr("prefix_retry_retried", int(retry_stats.get("retried", 0)))
+            trial.set_user_attr(
+                "prefix_retry_still_prefix_refusal",
+                int(retry_stats.get("still_prefix_refusal", 0)),
+            )
+            trial.set_user_attr(
+                "prefix_retry_fixed_prefix",
+                int(retry_stats.get("fixed_prefix", 0)),
+            )
+        global_gate_state = getattr(self.engine, "_global_concept_gate_state", None)
+        render_messages = getattr(self.engine, "_render_messages", None)
+        if global_gate_state is not None and callable(render_messages):
+            decision_cache = global_gate_state.get("decision_cache", {})
+            rendered = render_messages(self._prescreen_msgs)
+            if all(key in decision_cache for key in rendered):
+                gate_labels = [
+                    bool(decision_cache[key].reshape(-1)[0].item())
+                    for key in rendered
+                ]
+                trial.set_user_attr(
+                    "prescreen_gate_on_indices",
+                    [
+                        source_idx
+                        for source_idx, active in zip(
+                            self._prescreen_indices, gate_labels
+                        )
+                        if active
+                    ],
+                )
+                trial.set_user_attr(
+                    "prescreen_gate_off_indices",
+                    [
+                        source_idx
+                        for source_idx, active in zip(
+                            self._prescreen_indices, gate_labels
+                        )
+                        if not active
+                    ],
+                )
+            route_cache = global_gate_state.get("route_cache", {})
+            if route_cache and all(key in route_cache for key in rendered):
+                route_indices: dict[str, list[int]] = {}
+                for source_idx, key in zip(self._prescreen_indices, rendered):
+                    route_idx = int(route_cache[key].reshape(-1)[0].item())
+                    route_indices.setdefault(str(route_idx), []).append(source_idx)
+                trial.set_user_attr(
+                    "prescreen_direction_route_indices", route_indices
+                )
+            strength_feature_cache = global_gate_state.get(
+                "strength_feature_cache", {}
+            )
+            if strength_feature_cache and all(
+                key in strength_feature_cache for key in rendered
+            ):
+                trial.set_user_attr(
+                    "prescreen_strength_features",
+                    {
+                        str(source_idx): float(
+                            strength_feature_cache[key].reshape(-1)[0].item()
+                        )
+                        for source_idx, key in zip(
+                            self._prescreen_indices, rendered
+                        )
+                    },
+                )
+            signed_strength_feature_cache = global_gate_state.get(
+                "signed_strength_feature_cache", {}
+            )
+            if signed_strength_feature_cache and all(
+                key in signed_strength_feature_cache for key in rendered
+            ):
+                trial.set_user_attr(
+                    "prescreen_signed_strength_features",
+                    {
+                        str(source_idx): float(
+                            signed_strength_feature_cache[key].reshape(-1)[0].item()
+                        )
+                        for source_idx, key in zip(
+                            self._prescreen_indices, rendered
+                        )
+                    },
+                )
+            gate_score_cache = global_gate_state.get("gate_score_cache", {})
+            if gate_score_cache and all(key in gate_score_cache for key in rendered):
+                trial.set_user_attr(
+                    "prescreen_gate_scores",
+                    {
+                        str(source_idx): float(
+                            gate_score_cache[key].reshape(-1)[0].item()
+                        )
+                        for source_idx, key in zip(
+                            self._prescreen_indices, rendered
+                        )
+                    },
+                )
+            residual_cache = global_gate_state.get("prefill_residual_cache", {})
+            dump_residuals = bool(
+                getattr(
+                    getattr(self.config, "steering", None),
+                    "dump_steered_prefill_residuals",
+                    False,
+                )
+            )
+            if (
+                dump_residuals
+                and residual_cache
+                and all(key in residual_cache for key in rendered)
+            ):
+                stacked = torch.stack(
+                    [residual_cache[key] for key in rendered], dim=0
+                )
+                dump_path = os.path.join(
+                    self.config.optimization.checkpoint_dir,
+                    "steered_prefill_residuals.pt",
+                )
+                os.makedirs(self.config.optimization.checkpoint_dir, exist_ok=True)
+                torch.save(
+                    {
+                        "source_indices": list(self._prescreen_indices),
+                        "residuals": stacked.detach().to(
+                            device="cpu", dtype=torch.float32
+                        ),
+                        "refusal_indices": trial.user_attrs.get(
+                            "prescreen_refusal_indices", []
+                        ),
+                        "compliance_indices": trial.user_attrs.get(
+                            "prescreen_compliance_indices", []
+                        ),
+                    },
+                    dump_path,
+                )
+                trial.set_user_attr("steered_prefill_residual_dump", dump_path)
+                trial.set_user_attr(
+                    "steered_prefill_residual_count", int(stacked.shape[0])
+                )
+        gate_stats = getattr(self.engine, "_concept_gate_stats", None)
+        if gate_stats:
+            gate_active = sum(float(values[0].item()) for values in gate_stats.values())
+            gate_total = sum(float(values[1].item()) for values in gate_stats.values())
+            if gate_total:
+                gate_rate = gate_active / gate_total
+                trial.set_user_attr("concept_gate_active_rate", gate_rate)
+                trial.set_user_attr("concept_gate_active", int(gate_active))
+                trial.set_user_attr("concept_gate_total", int(gate_total))
+                print(f"  * Concept gate active: {gate_rate:.2%} of layer-tokens")
+
+        if opt.prescreen_reverse_order_replay:
+            replay_refusals = self.scorer.detector.evaluate_compliance(
+                self.engine, list(reversed(self._prescreen_msgs))
+            )
+            replay_delta = replay_refusals - detected_30
+            trial.set_user_attr("prescreen_reverse_refusals", replay_refusals)
+            trial.set_user_attr("prescreen_reverse_delta", replay_delta)
+            print(
+                "  * Reverse-order replay: "
+                f"{replay_refusals}/{len(self._prescreen_msgs)} "
+                f"(delta {replay_delta:+d})"
+            )
 
         if detected_30 >= opt.refusal_prescreen_prune_min:
             trial.set_user_attr("prescreen_class", "high")
@@ -210,7 +421,11 @@ class StageEvaluator:
                 f"  * Refusal prescreen: {detected_30}/{len(self._prescreen_msgs)} "
                 "[red]high[/] (prune)"
             )
-            raise TrialPruned()
+            # SC117: do NOT raise TrialPruned here — multi-objective TPE
+            # crashes on PRUNED trials (values=None). _objective converts
+            # this (0, True) + class=high marker into (inf, inf) objective
+            # values, which TPE's is_feasible filter ignores safely.
+            return 0, True
 
         elif detected_30 <= opt.refusal_prescreen_pass_max:
             trial.set_user_attr("prescreen_class", "low")
@@ -259,7 +474,13 @@ class StageEvaluator:
                 "unavailable[/]"
             )
             return
-        baseline_cont = baseline_cont[self._validation_indices]
+        # baseline_continuations is a Python list (strings); list[list[int]]
+        # fancy-indexing is not supported — gather explicitly.
+        idx = self._validation_indices
+        if isinstance(baseline_cont, (list, tuple)):
+            baseline_cont = [baseline_cont[i] for i in idx]
+        else:
+            baseline_cont = baseline_cont[idx]
 
         if vllm_gen is not None:
             v_logprobs = vllm_gen.score_continuation_logprobs_batched(
@@ -275,8 +496,12 @@ class StageEvaluator:
                 self.config.kl.token_count,
             )
 
-        # Baseline logprobs for just the validation subset.
-        baseline_v = self.scorer.baseline_logprobs[self._validation_indices]
+        # Baseline logprobs for just the validation subset (tensor OK with list idx).
+        base_lp_all = self.scorer.baseline_logprobs
+        if isinstance(base_lp_all, (list, tuple)):
+            baseline_v = torch.stack([base_lp_all[i] for i in idx])
+        else:
+            baseline_v = base_lp_all[idx]
 
         cur_lp = _finite_logprobs(v_logprobs)
         base_lp = _finite_logprobs(baseline_v)

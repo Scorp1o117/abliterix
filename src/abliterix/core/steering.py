@@ -149,46 +149,92 @@ def _rotate_toward_removal(
     direction: Tensor,
     fraction: float,
 ) -> Tensor:
-    """Geodesically rotate ``h`` toward the equator orthogonal to a direction."""
+    """Geodesically rotate ``h`` out of a direction or direction subspace.
+
+    ``direction`` may be a single vector ``(hidden,)`` or a stacked basis
+    ``(rank, hidden)``.  The rank-k path QR-orthonormalises the supplied rows
+    before removing their joint projection, so correlated extracted vectors
+    cannot apply the same removal twice.
+    """
     if fraction == 0.0:
         return h
 
     d = direction.to(h.device, dtype=h.dtype)
     if d.norm() == 0:
         return h
-    d = F.normalize(d, p=2, dim=0)
+
+    if d.ndim == 1:
+        # Preserve the historical single-direction operation order exactly.
+        # Ling's quantised MoE routing amplifies even mathematically equivalent
+        # floating-point rewrites into different generation outcomes.
+        d = F.normalize(d, p=2, dim=0)
+        raw_h_norm = h.norm(dim=-1, keepdim=True)
+        h_norm = raw_h_norm.clamp(min=1e-8)
+        h_hat = h / h_norm
+        projection = (h_hat @ d).unsqueeze(-1).clamp(-1.0, 1.0)
+        residual = h_hat - projection * d
+        residual_norm = residual.norm(dim=-1, keepdim=True)
+        removal_tangent = residual / residual_norm.clamp(min=1e-8)
+        fallback_axis = torch.zeros_like(d)
+        fallback_axis[d.abs().argmin()] = 1
+        fallback_tangent = F.normalize(
+            fallback_axis - (fallback_axis @ d) * d,
+            p=2,
+            dim=0,
+        )
+        removal_tangent = torch.where(
+            residual_norm <= 1e-6,
+            fallback_tangent,
+            removal_tangent,
+        )
+        alpha = torch.atan2(projection.abs(), residual_norm)
+        remaining = (1.0 - fraction) * alpha
+        h_hat_new = (
+            projection.sign() * torch.sin(remaining) * d
+            + torch.cos(remaining) * removal_tangent
+        )
+        return torch.where(raw_h_norm == 0, h, h_norm * h_hat_new)
+
+    if d.ndim != 2:
+        raise ValueError(
+            "angular direction must have shape (hidden,) or (rank, hidden), "
+            f"got {tuple(d.shape)}"
+        )
+    # QR on the transposed row stack yields an orthonormal column basis.
+    basis = torch.linalg.qr(d.T.float(), mode="reduced").Q.T.to(h.dtype)
 
     raw_h_norm = h.norm(dim=-1, keepdim=True)
     h_norm = raw_h_norm.clamp(min=1e-8)
     h_hat = h / h_norm
-    projection = (h_hat @ d).unsqueeze(-1).clamp(-1.0, 1.0)
-    residual = h_hat - projection * d
+    coefficients = h_hat @ basis.T
+    projection = coefficients @ basis
+    projection_norm = projection.norm(dim=-1, keepdim=True).clamp(max=1.0)
+    projection_tangent = projection / projection_norm.clamp(min=1e-8)
+    residual = h_hat - projection
     residual_norm = residual.norm(dim=-1, keepdim=True)
     removal_tangent = residual / residual_norm.clamp(min=1e-8)
 
     # Parallel activations do not define a unique great circle.  Pick a
     # deterministic orthogonal tangent by projecting the least-aligned
     # coordinate axis off the steering direction.
-    fallback_axis = torch.zeros_like(d)
-    fallback_axis[d.abs().argmin()] = 1
-    fallback_tangent = F.normalize(
-        fallback_axis - (fallback_axis @ d) * d,
-        p=2,
-        dim=0,
-    )
+    projector_diag = basis.square().sum(dim=0)
+    fallback_axis = torch.zeros_like(basis[0])
+    fallback_axis[projector_diag.argmin()] = 1
+    fallback_tangent = fallback_axis - (fallback_axis @ basis.T) @ basis
+    fallback_tangent = F.normalize(fallback_tangent, p=2, dim=0)
     removal_tangent = torch.where(
         residual_norm <= 1e-6,
         fallback_tangent,
         removal_tangent,
     )
 
-    # h_hat = sign(p) sin(alpha) d + cos(alpha) tangent.  Reducing alpha
-    # toward zero removes the directional component without crossing the
-    # tangent or inverting the activation.
-    alpha = torch.atan2(projection.abs(), residual_norm)
+    # h_hat = sin(alpha) projection_tangent + cos(alpha) removal_tangent.
+    # Reducing alpha toward zero removes the complete subspace component
+    # without crossing the orthogonal tangent or changing activation norm.
+    alpha = torch.atan2(projection_norm, residual_norm)
     remaining = (1.0 - fraction) * alpha
     h_hat_new = (
-        projection.sign() * torch.sin(remaining) * d
+        torch.sin(remaining) * projection_tangent
         + torch.cos(remaining) * removal_tangent
     )
     return torch.where(raw_h_norm == 0, h, h_norm * h_hat_new)
@@ -198,6 +244,7 @@ def _make_angular_hook(
     direction: Tensor,
     angle_degrees: float,
     adaptive: bool = False,
+    allow_overrotation: bool = False,
 ):
     """Create a forward hook that rotates activations toward removal.
 
@@ -217,7 +264,8 @@ def _make_angular_hook(
         If True, only rotate activations positively aligned with the
         direction (Adaptive Angular Steering), reducing interference.
     """
-    fraction = min(max(angle_degrees / 90.0, 0.0), 1.0)
+    max_fraction = 2.0 if allow_overrotation else 1.0
+    fraction = min(max(angle_degrees / 90.0, 0.0), max_fraction)
 
     def hook(module, input, output):
         h = output
@@ -227,6 +275,11 @@ def _make_angular_hook(
         h_new = _rotate_toward_removal(h, direction, fraction)
 
         if adaptive:
+            if direction.ndim != 1:
+                raise ValueError(
+                    "positive-alignment angular steering is undefined for a "
+                    "sign-arbitrary rank-k subspace"
+                )
             d = F.normalize(direction.to(h.device, dtype=h.dtype), p=2, dim=0)
             mask = ((h @ d).unsqueeze(-1) > 0).to(h_new.dtype)
             h_new = mask * h_new + (1 - mask) * h
@@ -236,6 +289,53 @@ def _make_angular_hook(
         return h_new
 
     return hook
+
+
+def _make_linear_projection_hook(
+    direction: Tensor,
+    fraction: float,
+    adaptive: bool = False,
+):
+    """Subtract a direction projection without activation-norm restoration."""
+    resolved_fraction = min(max(fraction, 0.0), 2.0)
+
+    def hook(module, input, output):
+        h = output[0] if isinstance(output, tuple) else output
+        if direction.ndim != 1:
+            raise ValueError("linear projection requires a single direction")
+        d = F.normalize(direction.to(h.device, dtype=h.dtype), p=2, dim=0)
+        projection = (h @ d).unsqueeze(-1) * d
+        h_new = h - resolved_fraction * projection
+        if adaptive:
+            mask = ((h @ d).unsqueeze(-1) > 0).to(h_new.dtype)
+            h_new = mask * h_new + (1 - mask) * h
+        if isinstance(output, tuple):
+            return (h_new,) + output[1:]
+        return h_new
+
+    return hook
+
+
+def _make_angular_pre_hook(
+    direction: Tensor,
+    angle_degrees: float,
+    adaptive: bool = False,
+):
+    """Adapt the angular output hook to a module forward-pre-hook.
+
+    This is used for residual junctions represented by the input of the next
+    normalisation module (for example Ling's post-attention residual before
+    ``post_attention_layernorm``).
+    """
+    output_hook = _make_angular_hook(direction, angle_degrees, adaptive=adaptive)
+
+    def pre_hook(module, args):
+        if not args:
+            return args
+        h_new = output_hook(module, (), args[0])
+        return (h_new,) + args[1:]
+
+    return pre_hook
 
 
 def apply_steering(
@@ -283,16 +383,16 @@ def apply_steering(
     steering_mode = config.steering.steering_mode
 
     if steering_vectors.ndim == 3:
-        runtime_hook_modes = {
-            SteeringMode.ANGULAR,
+        unsupported_runtime_hook_modes = {
             SteeringMode.ADAPTIVE_ANGULAR,
             SteeringMode.SPHERICAL,
             SteeringMode.VECTOR_FIELD,
         }
-        if steering_mode in runtime_hook_modes:
+        if steering_mode in unsupported_runtime_hook_modes:
             raise ValueError(
                 f"Multi-direction steering is not implemented for runtime hook "
-                f"mode {steering_mode.value!r}; use LoRA or dense direct mode."
+                f"mode {steering_mode.value!r}; use angular, sign-agnostic "
+                "concept-gated angular, LoRA, or dense direct mode."
             )
         if steering_mode == SteeringMode.DIRECT and engine.has_expert_routing():
             raise ValueError(
@@ -305,7 +405,16 @@ def apply_steering(
     # Reject rank-k tensors before either LoRA adapters or router/expert weights
     # are touched; otherwise the later layer lookup indexes the direction axis
     # and can fail after the LoRA update has already been committed.
-    if steering_vectors.ndim == 3 and safety_experts and routing_config is not None:
+    # Only treat routing as "active" when suppress/ablation is non-zero —
+    # configs that pin max_suppress=0 still build a zero ExpertRoutingConfig
+    # (and still have safety_experts from profiling), which previously
+    # blocked harmfulness_pair / multi-direction trials on MoE models.
+    _routing_active = routing_config is not None and (
+        routing_config.n_suppress > 0
+        or float(routing_config.expert_ablation_weight) > 0
+        or float(routing_config.router_bias) != 0.0
+    )
+    if steering_vectors.ndim == 3 and safety_experts and _routing_active:
         raise ValueError(
             "Multi-direction steering with HF MoE expert routing is not yet "
             "supported; disable expert routing or use a single direction."
@@ -382,6 +491,20 @@ def apply_steering(
             _apply_moe_steering(
                 engine, steering_vectors, global_vector, safety_experts, routing_config
             )
+        return
+
+    # --- Learned harmful-state gate + adaptive angular steering -----------
+    if steering_mode == SteeringMode.CONCEPT_GATED_ANGULAR:
+        _apply_angular_steering(
+            engine,
+            steering_vectors,
+            global_vector,
+            profiles,
+            config,
+            discriminative_layers,
+            adaptive=config.steering.concept_gate_positive_alignment_only,
+            concept_scorers=getattr(engine, "_concept_scorers", None),
+        )
         return
 
     # --- Spherical steering (geodesic rotation on hypersphere) ------------
@@ -512,9 +635,14 @@ def apply_steering(
                                 qs,
                             ).to(torch.float32),
                         )
-                        if engine._dequant_cache_bytes < engine._dequant_cache_max_bytes:
+                        if (
+                            engine._dequant_cache_bytes
+                            < engine._dequant_cache_max_bytes
+                        ):
                             engine._dequant_cache[mid] = W
-                            engine._dequant_cache_bytes += W.nelement() * W.element_size()
+                            engine._dequant_cache_bytes += (
+                                W.nelement() * W.element_size()
+                            )
                 elif CB is not None:
                     # Int8 quantisation: dequantise from CB data and SCB row scales.
                     mid = id(mod)
@@ -523,9 +651,14 @@ def apply_steering(
                     else:
                         SCB = base_weight.SCB  # ty:ignore[unresolved-attribute]
                         W = CB.float() * SCB.float().unsqueeze(1) / 127.0
-                        if engine._dequant_cache_bytes < engine._dequant_cache_max_bytes:
+                        if (
+                            engine._dequant_cache_bytes
+                            < engine._dequant_cache_max_bytes
+                        ):
                             engine._dequant_cache[mid] = W
-                            engine._dequant_cache_bytes += W.nelement() * W.element_size()
+                            engine._dequant_cache_bytes += (
+                                W.nelement() * W.element_size()
+                            )
                 elif _FP8_DTYPES and base_weight.dtype in _FP8_DTYPES:
                     # FP8: dequantise to fp32 via block-wise or per-tensor scale.
                     # Checks `weight_scale_inv` (block-wise; DeepSeek / MiniMax-M2
@@ -555,9 +688,14 @@ def apply_steering(
                                 scale,
                                 out_dtype=torch.float32,
                             )
-                        if engine._dequant_cache_bytes < engine._dequant_cache_max_bytes:
+                        if (
+                            engine._dequant_cache_bytes
+                            < engine._dequant_cache_max_bytes
+                        ):
                             engine._dequant_cache[mid] = W
-                            engine._dequant_cache_bytes += W.nelement() * W.element_size()
+                            engine._dequant_cache_bytes += (
+                                W.nelement() * W.element_size()
+                            )
                 else:
                     W = base_weight.to(torch.float32)
 
@@ -1380,6 +1518,7 @@ def _apply_angular_steering(
     config: AbliterixConfig,
     discriminative_layers: set[int] | None,
     adaptive: bool = False,
+    concept_scorers: dict | None = None,
 ):
     """Register forward hooks that rotate activations toward the compliance arc.
 
@@ -1394,11 +1533,70 @@ def _apply_angular_steering(
     if not hasattr(engine, "_angular_hooks"):
         engine._angular_hooks = []
 
+    site = config.steering.runtime_hook_site
+    installed = 0
+    gate_stats = None
+    if concept_scorers is not None:
+        gate_stats = {}
+        engine._concept_gate_stats = gate_stats
+    global_gate_state = (
+        {
+            "gate": None,
+            "preset_gate": None,
+            "route": None,
+            "preset_route": None,
+            "strength_feature": None,
+            "signed_strength_feature": None,
+            "gate_score": None,
+            "prefill_residual_layers": {},
+            "prepass_active": False,
+            "decision_cache": {},
+            "route_cache": {},
+            "strength_feature_cache": {},
+            "signed_strength_feature_cache": {},
+            "gate_score_cache": {},
+        }
+        if concept_scorers is not None
+        and config.steering.concept_gate_scope == "global_prompt"
+        else None
+    )
+    engine._global_concept_gate_state = global_gate_state
+    global_decision_layer = config.steering.concept_gate_global_decision_layer
+    if global_gate_state is not None and global_decision_layer not in concept_scorers:
+        raise ValueError(
+            "concept_gate_global_decision_layer has no trained concept scorer: "
+            f"{global_decision_layer}"
+        )
+
     for layer_idx in range(len(engine.transformer_layers)):
         if discriminative_layers is not None and layer_idx not in discriminative_layers:
             continue
 
         layer = engine.transformer_layers[layer_idx]
+
+        use_pre_hook = False
+        if site == "decoder_block":
+            hook_module = layer
+        elif site in {"attention_output", "kda_output", "mla_output"}:
+            layer_type = getattr(layer, "attention_layer_type", None)
+            if site == "kda_output" and layer_type != "linear_attention":
+                continue
+            if site == "mla_output" and layer_type != "attention":
+                continue
+            hook_module = getattr(layer, "attention", None) or getattr(
+                layer, "self_attn", None
+            )
+        elif site == "post_attention_residual":
+            hook_module = getattr(layer, "post_attention_layernorm", None)
+            use_pre_hook = True
+        elif site == "mlp_output":
+            hook_module = getattr(layer, "mlp", None)
+        else:  # shared_expert_output
+            mlp = getattr(layer, "mlp", None)
+            hook_module = getattr(mlp, "shared_experts", None)
+
+        if hook_module is None:
+            continue
 
         # Compute effective strength from profiles (use first component).
         component = next(iter(profiles))
@@ -1406,32 +1604,326 @@ def _apply_angular_steering(
 
         distance = cast(float, abs(layer_idx - sp.max_weight_position))
         if distance > sp.min_weight_distance:
-            continue
-
-        t = distance / sp.min_weight_distance
-        if kernel == DecayKernel.GAUSSIAN:
-            strength = sp.min_weight + (sp.max_weight - sp.min_weight) * math.exp(
-                -2.0 * t * t
-            )
-        elif kernel == DecayKernel.COSINE:
-            strength = sp.min_weight + (sp.max_weight - sp.min_weight) * (
-                0.5 * (1.0 + math.cos(math.pi * t))
-            )
-        else:  # LINEAR
-            strength = sp.max_weight + t * (sp.min_weight - sp.max_weight)
+            if global_gate_state is None or layer_idx != global_decision_layer:
+                continue
+            # Install a causal observer even when the selected decision layer
+            # lies outside the steering profile. Angle zero guarantees it only
+            # latches/broadcasts the score and leaves this layer unchanged.
+            strength = 0.0
+        else:
+            t = distance / sp.min_weight_distance
+            if kernel == DecayKernel.GAUSSIAN:
+                strength = sp.min_weight + (sp.max_weight - sp.min_weight) * math.exp(
+                    -2.0 * t * t
+                )
+            elif kernel == DecayKernel.COSINE:
+                strength = sp.min_weight + (sp.max_weight - sp.min_weight) * (
+                    0.5 * (1.0 + math.cos(math.pi * t))
+                )
+            else:  # LINEAR
+                strength = sp.max_weight + t * (sp.min_weight - sp.max_weight)
 
         # Strength is the fraction of full directional removal.  The hook
         # clamps values above 1.0 at the 90° removal tangent.
         angle = strength * 90.0
 
         if global_vector is None:
-            v = steering_vectors[layer_idx + 1]
+            if steering_vectors.ndim == 3:
+                fixed_direction_index = (
+                    config.steering.concept_gate_fixed_direction_index
+                )
+                v = (
+                    steering_vectors[fixed_direction_index, layer_idx + 1, :]
+                    if fixed_direction_index >= 0
+                    else steering_vectors[:, layer_idx + 1, :]
+                )
+            else:
+                v = steering_vectors[layer_idx + 1]
         else:
             v = global_vector
 
-        hook = _make_angular_hook(v, angle, adaptive=adaptive)
-        handle = layer.register_forward_hook(hook)
+        scorer = concept_scorers.get(layer_idx) if concept_scorers else None
+        if concept_scorers is not None and scorer is None:
+            continue
+
+        if scorer is not None:
+            hook = _make_concept_gated_angular_hook(
+                scorer,
+                v,
+                angle,
+                threshold=config.steering.concept_gate_threshold,
+                adaptive=adaptive,
+                pre_hook=use_pre_hook,
+                gate_stats=gate_stats,
+                gate_scope=config.steering.concept_gate_scope,
+                global_gate_state=global_gate_state,
+                is_global_decision_layer=(layer_idx == global_decision_layer),
+                direction_router=config.steering.concept_gate_direction_router,
+                allow_overrotation=(
+                    config.steering.concept_gate_angular_overrotation
+                ),
+                overrotation_phase=(
+                    config.steering.concept_gate_angular_overrotation_phase
+                ),
+                intervention_geometry=(
+                    config.steering.concept_gate_intervention_geometry
+                ),
+                layer_idx=layer_idx,
+                dump_prefill_residuals=(
+                    config.steering.dump_steered_prefill_residuals
+                ),
+            )
+            handle = (
+                hook_module.register_forward_pre_hook(hook)
+                if use_pre_hook
+                else hook_module.register_forward_hook(hook)
+            )
+        elif use_pre_hook:
+            hook = _make_angular_pre_hook(v, angle, adaptive=adaptive)
+            handle = hook_module.register_forward_pre_hook(hook)
+        else:
+            hook = _make_angular_hook(v, angle, adaptive=adaptive)
+            handle = hook_module.register_forward_hook(hook)
         engine._angular_hooks.append(handle)
+        installed += 1
+
+    if installed == 0:
+        raise ValueError(
+            f"runtime_hook_site={site!r} is unavailable in every selected "
+            "transformer layer"
+        )
+
+
+def _make_concept_gated_angular_hook(
+    scorer,
+    direction: Tensor,
+    angle_degrees: float,
+    *,
+    threshold: float,
+    adaptive: bool,
+    pre_hook: bool,
+    gate_stats: dict | None = None,
+    gate_scope: str = "token",
+    global_gate_state: dict | None = None,
+    is_global_decision_layer: bool = False,
+    direction_router: bool = False,
+    allow_overrotation: bool = False,
+    overrotation_phase: str = "all",
+    intervention_geometry: str = "angular",
+    layer_idx: int | None = None,
+    dump_prefill_residuals: bool = False,
+):
+    """Gate adaptive angular removal with a learned per-token concept score."""
+    legacy_angular_hook = _make_angular_hook(
+        direction,
+        angle_degrees,
+        adaptive=adaptive,
+        allow_overrotation=False,
+    )
+    overrotation_angular_hook = _make_angular_hook(
+        direction,
+        angle_degrees,
+        adaptive=adaptive,
+        allow_overrotation=allow_overrotation,
+    )
+    legacy_projection_hook = _make_linear_projection_hook(
+        direction,
+        min(max(angle_degrees / 90.0, 0.0), 1.0),
+        adaptive=adaptive,
+    )
+    overrotation_projection_hook = _make_linear_projection_hook(
+        direction,
+        min(max(angle_degrees / 90.0, 0.0), 2.0),
+        adaptive=adaptive,
+    )
+    latched_gate = None
+
+    def transform(module, output):
+        nonlocal latched_gate
+        h = output[0] if isinstance(output, tuple) else output
+        with torch.no_grad():
+            scorer_param = next(scorer.parameters())
+            if scorer_param.device != h.device or scorer_param.dtype != h.dtype:
+                scorer.to(device=h.device, dtype=h.dtype)
+            preset_gate = (
+                global_gate_state.get("preset_gate")
+                if global_gate_state is not None
+                else None
+            )
+            preset_route = (
+                global_gate_state.get("preset_route")
+                if global_gate_state is not None
+                else None
+            )
+            if (
+                gate_scope == "global_prompt"
+                and preset_gate is not None
+                and h.dim() >= 3
+                and preset_gate.shape[0] == h.shape[0]
+            ):
+                gate = preset_gate.to(device=h.device, dtype=h.dtype)
+                global_gate_state["gate"] = gate.detach()
+                if direction_router and preset_route is not None:
+                    global_gate_state["route"] = preset_route.to(device=h.device)
+            elif (
+                gate_scope == "global_prompt"
+                and is_global_decision_layer
+                and h.dim() >= 3
+                and h.shape[-2] > 1
+            ):
+                score = scorer(h[..., -1, :])
+                gate = (score >= threshold).to(h.dtype).unsqueeze(-2)
+                global_gate_state["gate"] = gate.detach()
+                global_gate_state["gate_score"] = score.detach()
+                feature_direction = direction
+                if feature_direction.ndim == 2:
+                    feature_direction = feature_direction[0]
+                unit_direction = F.normalize(
+                    feature_direction.to(h.device, dtype=h.dtype), p=2, dim=0
+                )
+                unit_final_h = F.normalize(h[..., -1, :], p=2, dim=-1)
+                signed_feature = (unit_final_h @ unit_direction).unsqueeze(-1)
+                global_gate_state["signed_strength_feature"] = (
+                    signed_feature.detach()
+                )
+                global_gate_state["strength_feature"] = signed_feature.abs().detach()
+                if direction_router:
+                    if direction.ndim != 2:
+                        raise ValueError(
+                            "direction router requires a rank-k direction matrix"
+                        )
+                    basis = F.normalize(
+                        direction.to(h.device, dtype=h.dtype), p=2, dim=1
+                    )
+                    final_h = F.normalize(h[..., -1, :], p=2, dim=-1)
+                    route = (final_h @ basis.T).abs().argmax(
+                        dim=-1, keepdim=True
+                    ).unsqueeze(-1)
+                    global_gate_state["route"] = route.detach()
+            elif (
+                gate_scope == "global_prompt"
+                and global_gate_state is not None
+                and global_gate_state.get("gate") is not None
+                and h.dim() >= 3
+                and global_gate_state["gate"].shape[0] == h.shape[0]
+            ):
+                gate = global_gate_state["gate"].to(device=h.device, dtype=h.dtype)
+            elif gate_scope == "global_prompt":
+                # A decision layer later than this hook cannot causally control
+                # earlier layers during prefill. Keep them unchanged.
+                gate = torch.zeros(*h.shape[:-1], 1, device=h.device, dtype=h.dtype)
+            elif gate_scope == "prompt" and h.dim() >= 3 and h.shape[-2] > 1:
+                # Training residuals come from the final post-instruction
+                # token. Match that distribution at prefill, then retain the
+                # per-sample/layer decision for every autoregressive step.
+                score = scorer(h[..., -1, :])
+                gate = (score >= threshold).to(h.dtype).unsqueeze(-2)
+                latched_gate = gate.detach()
+            elif (
+                gate_scope == "prompt"
+                and latched_gate is not None
+                and h.dim() >= 3
+                and latched_gate.shape[0] == h.shape[0]
+            ):
+                gate = latched_gate.to(device=h.device, dtype=h.dtype)
+            else:
+                score = scorer(h)
+                gate = (score >= threshold).to(h.dtype)
+            if gate_stats is not None and not (
+                global_gate_state is not None
+                and global_gate_state.get("prepass_active", False)
+            ):
+                gate_for_stats = gate.expand(*h.shape[:-1], 1)
+                key = str(h.device)
+                if key not in gate_stats:
+                    gate_stats[key] = [
+                        torch.zeros((), device=h.device, dtype=torch.float32),
+                        torch.zeros((), device=h.device, dtype=torch.float32),
+                    ]
+                gate_stats[key][0].add_(gate_for_stats.sum(dtype=torch.float32))
+                gate_stats[key][1].add_(gate_for_stats.numel())
+        is_prefill = h.dim() >= 3 and h.shape[-2] > 1
+        phase_enabled = (
+            overrotation_phase == "all"
+            or (overrotation_phase == "prefill" and is_prefill)
+            or (overrotation_phase == "decode" and not is_prefill)
+        )
+        phase_overrotation = allow_overrotation and phase_enabled
+        if direction_router:
+            route = (
+                global_gate_state.get("route")
+                if global_gate_state is not None
+                else None
+            )
+            if route is None or direction.ndim != 2:
+                h_steered = h
+            else:
+                h_steered = h
+                for direction_idx in range(direction.shape[0]):
+                    fraction = min(
+                        max(angle_degrees / 90.0, 0.0),
+                        2.0 if phase_overrotation else 1.0,
+                    )
+                    if intervention_geometry == "linear_projection":
+                        d = F.normalize(
+                            direction[direction_idx].to(h.device, dtype=h.dtype),
+                            p=2,
+                            dim=0,
+                        )
+                        candidate = h - fraction * (h @ d).unsqueeze(-1) * d
+                    else:
+                        candidate = _rotate_toward_removal(
+                            h,
+                            direction[direction_idx],
+                            fraction,
+                        )
+                    route_mask = (route == direction_idx).to(h.dtype)
+                    h_steered = route_mask * candidate + (1 - route_mask) * h_steered
+        else:
+            if intervention_geometry == "linear_projection":
+                selected_hook = (
+                    overrotation_projection_hook
+                    if phase_overrotation
+                    else legacy_projection_hook
+                )
+            else:
+                selected_hook = (
+                    overrotation_angular_hook
+                    if phase_overrotation
+                    else legacy_angular_hook
+                )
+            h_steered = selected_hook(module, (), h)
+        h_new = gate * h_steered + (1 - gate) * h
+        if (
+            dump_prefill_residuals
+            and layer_idx is not None
+            and global_gate_state is not None
+            and global_gate_state.get("prepass_active", False)
+            and h_new.dim() >= 3
+            and h_new.shape[-2] > 1
+        ):
+            residual = h_new[..., -1, :].detach().to(
+                device="cpu", dtype=torch.float32
+            )
+            layers = global_gate_state.setdefault("prefill_residual_layers", {})
+            layers[int(layer_idx)] = residual
+        if isinstance(output, tuple):
+            return (h_new,) + output[1:]
+        return h_new
+
+    if pre_hook:
+
+        def concept_pre_hook(module, args):
+            if not args:
+                return args
+            return (transform(module, args[0]),) + args[1:]
+
+        return concept_pre_hook
+
+    def concept_hook(module, inputs, output):
+        return transform(module, output)
+
+    return concept_hook
 
 
 # ---------------------------------------------------------------------------

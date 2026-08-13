@@ -203,6 +203,179 @@ def _orthonormalize_direction_rows(directions: Tensor) -> Tensor:
     return result.to(directions.dtype)
 
 
+def build_failure_conditioned_variants(
+    primary_vectors: Tensor,
+    calibration_states: Tensor,
+    refusal_indices: list[int],
+    compliance_indices: list[int],
+    alphas: list[float],
+) -> dict[str, Tensor]:
+    """Blend a primary direction with a calibration-failure residual.
+
+    The calibration labels must come from a training-only counterfactual
+    probe.  For each layer, the mean residual of primary-direction failures
+    minus the mean residual of successes is projected orthogonal to the exact
+    primary direction.  Each returned candidate is a *single* unit direction,
+    preserving the legacy scalar angular-removal path during evaluation.
+
+    Prompt text is neither accepted nor persisted by this helper; only clean
+    residual tensors and anonymous row indices are consumed.
+    """
+    if primary_vectors.ndim != 2 or calibration_states.ndim != 3:
+        raise ValueError(
+            "primary_vectors must be rank 2 and calibration_states rank 3"
+        )
+    if calibration_states.shape[1:] != primary_vectors.shape:
+        raise ValueError(
+            "calibration state layer/hidden dimensions must match primary vectors"
+        )
+    if not refusal_indices or not compliance_indices:
+        raise ValueError("both refusal and compliance calibration sets are required")
+
+    observed = refusal_indices + compliance_indices
+    if len(set(observed)) != len(observed):
+        raise ValueError("calibration refusal/compliance indices must be disjoint")
+    if min(observed) < 0 or max(observed) >= calibration_states.shape[0]:
+        raise IndexError("calibration outcome index is outside the residual rows")
+
+    # Use a float-normalised copy for the blend geometry, but preserve the
+    # exact source tensor for the control.  On quantised MoE models even a
+    # redundant pre-normalisation can change downstream router decisions.
+    primary = F.normalize(primary_vectors.float(), p=2, dim=-1)
+    failures = calibration_states[refusal_indices].float().mean(dim=0)
+    successes = calibration_states[compliance_indices].float().mean(dim=0)
+    residual = failures - successes
+    residual = residual - (residual * primary).sum(dim=-1, keepdim=True) * primary
+    residual_norm = torch.linalg.vector_norm(residual, dim=-1, keepdim=True)
+    tolerance = torch.finfo(residual.dtype).eps * residual.shape[-1]
+    secondary = torch.where(
+        residual_norm > tolerance,
+        residual / residual_norm.clamp_min(torch.finfo(residual.dtype).tiny),
+        torch.zeros_like(residual),
+    )
+
+    variants = {"primary": primary_vectors.clone()}
+    for alpha in alphas:
+        if not torch.isfinite(torch.tensor(alpha)):
+            raise ValueError("failure-direction alpha values must be finite")
+        label = f"failure_alpha_{float(alpha):g}".replace("-", "neg_").replace(
+            ".", "p"
+        )
+        candidate = F.normalize(primary + float(alpha) * secondary, p=2, dim=-1)
+        variants[label] = candidate.to(primary_vectors.dtype)
+    return variants
+
+
+def align_decoder_residuals_to_primary(
+    primary_vectors: Tensor,
+    decoder_residuals: Tensor,
+) -> Tensor:
+    """Pad hooked decoder residuals into the primary ``(layers+1, hidden)`` layout.
+
+    Runtime hooks record one row per transformer layer.  Cached primary
+    vectors also include the embedding slot at index 0 and any extra MTP
+    slot after the last decoder layer.  Unhooked slots stay zero.
+    """
+    if primary_vectors.ndim != 2 or decoder_residuals.ndim != 3:
+        raise ValueError(
+            "primary_vectors must be rank 2 and decoder_residuals rank 3"
+        )
+    n_rows, n_layers, hidden = decoder_residuals.shape
+    if hidden != primary_vectors.shape[-1]:
+        raise ValueError("residual hidden size must match primary vectors")
+    if n_layers == primary_vectors.shape[0]:
+        return decoder_residuals
+    if n_layers + 2 == primary_vectors.shape[0]:
+        aligned = primary_vectors.new_zeros(
+            n_rows, primary_vectors.shape[0], hidden
+        )
+        aligned[:, 1 : 1 + n_layers, :] = decoder_residuals.to(
+            dtype=primary_vectors.dtype
+        )
+        return aligned
+    raise ValueError(
+        "decoder residual layer count must match primary or primary-2 "
+        f"(embed + MTP padding); got {n_layers} vs {primary_vectors.shape[0]}"
+    )
+
+
+def compose_exact_primary_with_steered_peel(
+    primary_vectors: Tensor,
+    decoder_residuals: Tensor,
+    source_indices: list[int],
+    refusal_indices: list[int],
+    compliance_indices: list[int],
+) -> Tensor:
+    """Stack a bitwise-exact primary with a steered failure residual.
+
+    ``decoder_residuals`` are anonymous post-hook final-prefill states from a
+    training-only primary replay.  The secondary is the unit residual of
+    mean(failure) − mean(success), orthogonalised to the exact primary.  It
+    is *not* blended back into the primary; sequential application is a
+    later decision.
+    """
+    aligned = align_decoder_residuals_to_primary(primary_vectors, decoder_residuals)
+    if len(source_indices) != aligned.shape[0]:
+        raise ValueError("source_indices length must match residual rows")
+    if len(set(source_indices)) != len(source_indices):
+        raise ValueError("source_indices must be unique")
+    n_rows = max(source_indices) + 1
+    states = aligned.new_zeros((n_rows, *aligned.shape[1:]))
+    for row, source_idx in enumerate(source_indices):
+        if source_idx < 0:
+            raise IndexError("source index must be non-negative")
+        states[source_idx] = aligned[row]
+
+    # Validate labels through the existing helper, then keep the unblended
+    # residual so v59 can counterfactual it as a standalone direction.
+    build_failure_conditioned_variants(
+        primary_vectors,
+        states,
+        refusal_indices,
+        compliance_indices,
+        [1.0],
+    )
+    primary = F.normalize(primary_vectors.float(), p=2, dim=-1)
+    failures = states[refusal_indices].float().mean(dim=0)
+    successes = states[compliance_indices].float().mean(dim=0)
+    leftover = failures - successes
+    leftover = leftover - (leftover * primary).sum(dim=-1, keepdim=True) * primary
+    leftover_norm = torch.linalg.vector_norm(leftover, dim=-1, keepdim=True)
+    tolerance = torch.finfo(leftover.dtype).eps * leftover.shape[-1]
+    secondary = torch.where(
+        leftover_norm > tolerance,
+        leftover / leftover_norm.clamp_min(torch.finfo(leftover.dtype).tiny),
+        torch.zeros_like(leftover),
+    )
+    composed = primary_vectors.new_empty((2, *primary_vectors.shape))
+    composed[0] = primary_vectors
+    composed[1] = secondary.to(dtype=primary_vectors.dtype)
+    return composed
+
+
+def build_renormalized_primary_variants(
+    primary_vectors: Tensor,
+    repeats: int,
+) -> dict[str, Tensor]:
+    """Return repeated float32-pre-normalised primary probes.
+
+    Duplicate names intentionally produce identical tensors in separate
+    Optuna trials.  This measures within-process outcome stability before a
+    numerically distinct primary representation is promoted to full eval.
+    """
+    if primary_vectors.ndim != 2:
+        raise ValueError("primary_vectors must have shape (layers, hidden)")
+    if repeats < 1:
+        raise ValueError("renormalized primary repeats must be positive")
+    normalized = F.normalize(primary_vectors.float(), p=2, dim=-1).to(
+        primary_vectors.dtype
+    )
+    return {
+        f"renormalized_primary_{repeat}": normalized.clone()
+        for repeat in range(repeats)
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main API
 # ---------------------------------------------------------------------------

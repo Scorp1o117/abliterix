@@ -529,10 +529,16 @@ class TrialScorer:
                 raise RuntimeError(
                     "Multi-token HF KL requires captured baseline continuations"
                 )
+            # SC117: coherence only needs response LENGTHS (z-score vs
+            # baseline); generating the full max_gen_tokens=160 per prompt
+            # on a single-GPU 512-expert MoE takes ~3-5 min each → the
+            # whole coherence pass stalls for hours. Cap at 64 tokens:
+            # still longer than the baseline mean (~50 words) so truncation
+            # degeneration stays detectable.
             responses = engine.generate_text_batched(
                 self.benign_msgs,
                 skip_special_tokens=True,
-                max_new_tokens=self.config.inference.max_gen_tokens,
+                max_new_tokens=min(self.config.inference.max_gen_tokens, 64),
                 min_new_tokens=self.config.inference.min_gen_tokens,
             )
             logprobs = engine.score_continuation_logprobs_batched(

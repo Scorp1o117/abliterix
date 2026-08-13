@@ -604,6 +604,31 @@ class SteeringConfig(BaseModel):
         ),
     )
 
+    response_pair_enabled: bool = Field(
+        default=False,
+        description=(
+            "Build the two residual streams from the same prompts and system "
+            "message, teacher-forcing a compliance continuation for the benign "
+            "slot and a refusal continuation for the target slot. This isolates "
+            "assistant response-trajectory differences from prompt topic."
+        ),
+    )
+
+    response_pair_compliance_text: str = Field(
+        default="Sure. Here is a direct answer:",
+        description="Teacher-forced assistant continuation for the compliance slot.",
+    )
+
+    response_pair_refusal_text: str = Field(
+        default="I'm sorry, but I can't help with that request.",
+        description="Teacher-forced assistant continuation for the refusal slot.",
+    )
+
+    response_pair_pooling: Literal["mean", "last"] = Field(
+        default="mean",
+        description="How to pool continuation-token residuals for each layer.",
+    )
+
     ablate_harmfulness_direction: bool = Field(
         default=False,
         description=(
@@ -642,10 +667,407 @@ class SteeringConfig(BaseModel):
             '"lora" modifies model weights via LoRA adapters, '
             '"angular" rotates activations at inference time via hooks, '
             '"adaptive_angular" rotates only aligned activations (reduces interference), '
+            '"concept_gated_angular" additionally requires a learned harmful-state '
+            "classifier to fire before applying adaptive angular removal, "
             '"spherical" rotates along geodesics on the activation hypersphere, '
             '"vector_field" uses learned context-dependent steering directions, '
             '"direct" modifies base weights in-place via orthogonal projection '
             "(required for models with double-norm like Gemma 4 where LoRA is ineffective)."
+        ),
+    )
+
+    runtime_hook_site: Literal[
+        "decoder_block",
+        "attention_output",
+        "kda_output",
+        "mla_output",
+        "post_attention_residual",
+        "mlp_output",
+        "shared_expert_output",
+    ] = Field(
+        default="decoder_block",
+        description=(
+            "Module output where angular/adaptive-angular runtime steering is "
+            "applied. decoder_block preserves the historical whole-block "
+            "behaviour; the other sites support architecture-aware causal "
+            "localisation before the residual additions. kda_output and "
+            "mla_output use a layer's attention_layer_type marker."
+        ),
+    )
+
+    search_runtime_hook_site: bool = Field(
+        default=False,
+        description=(
+            "Let Optuna choose runtime_hook_site per trial. Intended for "
+            "angular/adaptive-angular causal probes; unavailable sites are "
+            "skipped and a trial fails explicitly if no layer supports the site."
+        ),
+    )
+
+    runtime_hook_site_choices: list[
+        Literal[
+            "decoder_block",
+            "attention_output",
+            "kda_output",
+            "mla_output",
+            "post_attention_residual",
+            "mlp_output",
+            "shared_expert_output",
+        ]
+    ] = Field(
+        default=[
+            "decoder_block",
+            "kda_output",
+            "mla_output",
+            "post_attention_residual",
+            "mlp_output",
+            "shared_expert_output",
+        ],
+        min_length=1,
+        description="Candidate sites when search_runtime_hook_site=true.",
+    )
+
+    concept_gate_threshold: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum ConceptScorer harmful-state probability required to "
+            "activate concept_gated_angular steering for a token."
+        ),
+    )
+
+    concept_gate_positive_alignment_only: bool = Field(
+        default=True,
+        description=(
+            "When concept_gated_angular is active, preserve the historical "
+            "adaptive-angular safeguard that only removes direction components "
+            "from positively aligned token activations. Disable only for "
+            "sample-level gates with demonstrated benign isolation to remove "
+            "both signs of the gated direction component."
+        ),
+    )
+
+    concept_gate_angular_overrotation: bool = Field(
+        default=False,
+        description=(
+            "Allow concept-gated angular strength above 1.0 to continue past "
+            "the direction-orthogonal tangent, up to a 2.0 fraction. Default "
+            "false preserves the historical 90-degree clamp."
+        ),
+    )
+
+    search_concept_gate_angular_overrotation: bool = Field(
+        default=False,
+        description=(
+            "Let Optuna compare the historical angular clamp with gated "
+            "over-rotation on a per-trial basis."
+        ),
+    )
+
+    concept_gate_angular_overrotation_phase: Literal[
+        "all", "prefill", "decode"
+    ] = Field(
+        default="all",
+        description=(
+            "When gated angular over-rotation is enabled, apply it during "
+            "all forwards, prompt prefill only, or autoregressive decode only. "
+            "The other phase retains the historical 90-degree clamp."
+        ),
+    )
+
+    search_concept_gate_angular_overrotation_phase: bool = Field(
+        default=False,
+        description=(
+            "Let Optuna compare all/prefill/decode over-rotation phases per trial."
+        ),
+    )
+
+    concept_gate_intervention_geometry: Literal[
+        "angular", "linear_projection"
+    ] = Field(
+        default="angular",
+        description=(
+            "Geometry used after the concept gate activates. Angular preserves "
+            "the original activation norm; linear_projection subtracts the "
+            "direction component without radial renormalization."
+        ),
+    )
+
+    search_concept_gate_intervention_geometry: bool = Field(
+        default=False,
+        description=(
+            "Let Optuna compare norm-preserving angular steering with an "
+            "unnormalized linear direction projection per trial."
+        ),
+    )
+
+    search_concept_gate_threshold: bool = Field(
+        default=False,
+        description=(
+            "Let Optuna choose concept_gate_threshold per trial. Intended for "
+            "concept_gated_angular calibration sweeps."
+        ),
+    )
+
+    concept_gate_threshold_range: list[float] = Field(
+        default=[0.0, 1.0],
+        min_length=2,
+        max_length=2,
+        description="Lower and upper bounds for concept-gate threshold search.",
+    )
+
+    concept_gate_scope: Literal["token", "prompt", "global_prompt"] = Field(
+        default="token",
+        description=(
+            "Granularity of concept_gated_angular decisions. token scores every "
+            "activation independently; prompt scores the final prefill token "
+            "per layer and latches it through decode; global_prompt uses one "
+            "configured early layer to make a sample decision and broadcasts it "
+            "to every subsequent steering layer."
+        ),
+    )
+
+    concept_gate_global_decision_layer: int = Field(
+        default=-1,
+        ge=-2,
+        description=(
+            "Decoder layer whose final-prefill scorer supplies the broadcast "
+            "decision when concept_gate_scope='global_prompt'. -1 selects the "
+            "earliest layer passing the internal grouped validation guard; -2 "
+            "selects the maximum-gap internally valid layer up to the configured "
+            "candidate maximum."
+        ),
+    )
+
+    concept_gate_global_candidate_max_layer: int = Field(
+        default=20,
+        ge=0,
+        description=(
+            "Latest layer considered by global_prompt automatic selection. Keep "
+            "this at or before the steering profile start so the useful profile "
+            "is not skipped during prefill."
+        ),
+    )
+
+    concept_gate_global_single_sample_prepass: bool = Field(
+        default=False,
+        description=(
+            "For global_prompt gates, compute each sample's final-prefill "
+            "decision in an isolated batch-of-one forward pass, then inject "
+            "the fixed decisions into the real generation batch. This avoids "
+            "batch-composition-dependent gate flips on quantized MoE models."
+        ),
+    )
+
+    concept_gate_global_canonical_batching: bool = Field(
+        default=False,
+        description=(
+            "For global_prompt evaluation, sort prompts by rendered token length "
+            "and rendered content before batching, then restore caller order. "
+            "This makes batch membership independent of input permutation."
+        ),
+    )
+
+    dump_steered_prefill_residuals: bool = Field(
+        default=False,
+        description=(
+            "During the global single-sample prepass, persist each sample's "
+            "post-hook final-prefill residual at every hooked decoder layer. "
+            "The evaluator writes an anonymous source-index tensor cache for "
+            "train-only steered residual peel; prompt text is not stored."
+        ),
+    )
+
+    concept_gate_refusal_prefix_retry: bool = Field(
+        default=False,
+        description=(
+            "If a gate-on sample starts with a keyword refusal prefix, regenerate "
+            "the same batch once while banning that sample's first prefix tokens. "
+            "This is a decode-mechanism probe, not a new residual direction."
+        ),
+    )
+    search_concept_gate_refusal_prefix_retry: bool = Field(
+        default=False,
+        description=(
+            "Let Optuna compare refusal-prefix retry on versus off per trial."
+        ),
+    )
+    concept_gate_refusal_prefix_ban_tokens: int = Field(
+        default=6,
+        ge=1,
+        le=16,
+        description=(
+            "How many leading generated tokens from the first refusal prefix "
+            "are banned on the retry pass."
+        ),
+    )
+
+    concept_gate_direction_router: bool = Field(
+        default=False,
+        description=(
+            "For a rank-k global-prompt concept gate, select exactly one "
+            "direction per sample at the decision layer by maximum absolute "
+            "final-prefill projection, then latch that route through decode. "
+            "This avoids jointly removing the full rank-k subspace."
+        ),
+    )
+
+    concept_gate_fixed_direction_index: int = Field(
+        default=-1,
+        ge=-1,
+        description=(
+            "For rank-k angular probes, apply one fixed direction row. -1 "
+            "keeps the normal joint/router behavior."
+        ),
+    )
+
+    search_concept_gate_fixed_direction: bool = Field(
+        default=False,
+        description=(
+            "Let Optuna choose one fixed rank-k direction index per trial. "
+            "Intended for train-only counterfactual calibration probes."
+        ),
+    )
+
+    calibration_failure_refusal_indices: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Anonymous target-evaluation row indices where a training-only "
+            "primary-direction calibration probe still refused. Used only to "
+            "derive failure-conditioned steering-vector variants."
+        ),
+    )
+
+    calibration_failure_compliance_indices: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Anonymous successful row indices from the same training-only "
+            "calibration probe. Must be disjoint from refusal indices."
+        ),
+    )
+
+    calibration_failure_alphas: list[float] = Field(
+        default_factory=list,
+        description=(
+            "Blend weights for primary + alpha times the primary-orthogonal "
+            "failure-minus-success residual direction. Non-empty values enable "
+            "a categorical single-direction variant probe."
+        ),
+    )
+
+    calibration_failure_prompt_split: str | None = Field(
+        default=None,
+        description=(
+            "Optional split used only to extract failure-conditioned "
+            "calibration residuals. When set, target evaluation prompts remain "
+            "unchanged, preventing formal-eval residual leakage."
+        ),
+    )
+
+    calibration_failure_variant_repeats: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Expose each failure-conditioned blend as repeated byte-identical "
+            "categorical variants. Values above 1 omit the primary control and "
+            "are intended for formal stability probes."
+        ),
+    )
+
+    renormalized_primary_probe_repeats: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Expose repeated, numerically identical float32-pre-normalised "
+            "primary directions as categorical trials. Intended to audit "
+            "quantized-MoE outcome stability; 0 disables the probe."
+        ),
+    )
+
+    concept_gate_training_source: Literal[
+        "prompt_final",
+        "response_trajectory",
+        "generated_prompt_trajectory",
+    ] = Field(
+        default="prompt_final",
+        description=(
+            "Activations used to train concept_gated_angular classifiers. "
+            "prompt_final uses ordinary benign/harmful prompt residuals; "
+            "response_trajectory uses fixed compliance/refusal continuations; "
+            "generated_prompt_trajectory trains on final-prefill plus early "
+            "decode states from the model's own benign/harmful generations."
+        ),
+    )
+
+    concept_gate_trajectory_tokens_per_prompt: int = Field(
+        default=4,
+        ge=1,
+        description=(
+            "Maximum uniformly-spaced continuation tokens retained per prompt "
+            "when concept_gate_training_source='response_trajectory'."
+        ),
+    )
+
+    concept_gate_trajectory_validation_fraction: float = Field(
+        default=0.2,
+        gt=0.0,
+        lt=0.5,
+        description=(
+            "Prompt-grouped hold-out fraction used to validate response-trajectory "
+            "concept scorers before generation."
+        ),
+    )
+
+    concept_gate_trajectory_min_validation_accuracy: float = Field(
+        default=0.7,
+        ge=0.5,
+        le=1.0,
+        description=(
+            "Minimum mean held-out accuracy required before a response-trajectory "
+            "gate is allowed to proceed to generation."
+        ),
+    )
+
+    concept_gate_trajectory_min_active_gap: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum held-out refusal-minus-compliance gate activation gap "
+            "required before generation."
+        ),
+    )
+
+    concept_gate_generated_prompts_per_class: int = Field(
+        default=200,
+        ge=2,
+        description=(
+            "Number of benign and harmful prompts sampled for generated-prompt "
+            "trajectory gate training and grouped validation."
+        ),
+    )
+
+    concept_gate_generated_max_new_tokens: int = Field(
+        default=12,
+        ge=1,
+        description="Number of deterministic free-running tokens generated per prompt.",
+    )
+
+    concept_gate_generated_tokens_per_prompt: int = Field(
+        default=8,
+        ge=1,
+        description=(
+            "Maximum number of earliest generated-token states retained per prompt."
+        ),
+    )
+
+    concept_gate_generated_prompt_state_repeats: int = Field(
+        default=4,
+        ge=1,
+        description=(
+            "Number of times each final-prefill state is repeated in the training "
+            "set so the initial gate decision is not swamped by decode tokens."
         ),
     )
 
@@ -1159,6 +1581,72 @@ class SteeringConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_steering_combos(self) -> "SteeringConfig":
+        gate_lo, gate_hi = self.concept_gate_threshold_range
+        if not (0.0 <= gate_lo <= gate_hi <= 1.0):
+            raise ValueError(
+                "concept_gate_threshold_range must satisfy "
+                f"0 <= lo <= hi <= 1, got {self.concept_gate_threshold_range}."
+            )
+        if (
+            self.search_concept_gate_threshold
+            and self.steering_mode != SteeringMode.CONCEPT_GATED_ANGULAR
+        ):
+            raise ValueError(
+                "search_concept_gate_threshold=true requires "
+                "steering_mode='concept_gated_angular'."
+            )
+        if self.concept_gate_training_source in {
+            "response_trajectory",
+            "generated_prompt_trajectory",
+        }:
+            if self.steering_mode != SteeringMode.CONCEPT_GATED_ANGULAR:
+                raise ValueError(
+                    "trajectory concept-gate training requires "
+                    "steering_mode='concept_gated_angular'."
+                )
+        if self.concept_gate_training_source == "response_trajectory":
+            if not self.response_pair_compliance_text.strip():
+                raise ValueError("response_pair_compliance_text must not be empty.")
+            if not self.response_pair_refusal_text.strip():
+                raise ValueError("response_pair_refusal_text must not be empty.")
+            if (
+                self.response_pair_compliance_text.strip()
+                == self.response_pair_refusal_text.strip()
+            ):
+                raise ValueError(
+                    "response-trajectory compliance and refusal continuations "
+                    "must differ."
+                )
+        if (
+            self.concept_gate_generated_tokens_per_prompt
+            > self.concept_gate_generated_max_new_tokens
+        ):
+            raise ValueError(
+                "concept_gate_generated_tokens_per_prompt must not exceed "
+                "concept_gate_generated_max_new_tokens."
+            )
+        if self.response_pair_enabled:
+            if self.vector_method != VectorMethod.MEAN:
+                raise ValueError(
+                    "response_pair_enabled=true currently requires "
+                    "vector_method='mean'."
+                )
+            if not self.response_pair_compliance_text.strip():
+                raise ValueError("response_pair_compliance_text must not be empty.")
+            if not self.response_pair_refusal_text.strip():
+                raise ValueError("response_pair_refusal_text must not be empty.")
+            if (
+                self.response_pair_compliance_text.strip()
+                == self.response_pair_refusal_text.strip()
+            ):
+                raise ValueError(
+                    "response-pair compliance and refusal continuations must differ."
+                )
+            if self.n_directions != 1 or self.ablate_harmfulness_direction:
+                raise ValueError(
+                    "response_pair_enabled=true currently supports one direction "
+                    "and is incompatible with harmfulness-pair extraction."
+                )
         if self.vector_method == VectorMethod.SAE:
             if not self.sae_path:
                 raise ValueError(
@@ -1294,6 +1782,15 @@ class OptimizationConfig(BaseModel):
     prescreen_estimation_enabled: bool = Field(
         default=True,
         description="Skip full evaluation for 'low' trials and use prescreen estimate.",
+    )
+
+    prescreen_reverse_order_replay: bool = Field(
+        default=False,
+        description=(
+            "Diagnostic-only: rerun the same prescreen prompts in reverse order "
+            "and record the refusal-count delta. This changes batch composition "
+            "without changing the prompt set."
+        ),
     )
 
     validation_kl_enabled: bool = Field(
@@ -1994,6 +2491,40 @@ class AbliterixConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_cross_section_combos(self) -> "AbliterixConfig":
+        if self.steering.response_pair_enabled:
+            benign = self.benign_prompts
+            target = self.target_prompts
+            paired_source_fields = ("dataset", "split", "column", "prefix", "suffix")
+            mismatched = [
+                field
+                for field in paired_source_fields
+                if getattr(benign, field) != getattr(target, field)
+            ]
+            benign_system = (
+                self.system_prompt
+                if benign.system_prompt is None
+                else benign.system_prompt
+            )
+            target_system = (
+                self.system_prompt
+                if target.system_prompt is None
+                else target.system_prompt
+            )
+            if benign_system != target_system:
+                mismatched.append("system_prompt")
+            if mismatched:
+                raise ValueError(
+                    "response_pair_enabled=true requires identical benign/target "
+                    "prompt sources; mismatched fields: " + ", ".join(mismatched)
+                )
+            if (
+                self.iterative.enabled
+                or self.steering.vector_method == VectorMethod.RDO
+            ):
+                raise ValueError(
+                    "response_pair_enabled=true is incompatible with iterative/RDO "
+                    "extraction."
+                )
         # Iterative path passes its own n_directions and does not forward the
         # harmfulness flag — combining them would silently drop the harmfulness
         # signal. Reject explicitly so the misconfiguration surfaces at config
@@ -2014,17 +2545,97 @@ class AbliterixConfig(BaseSettings):
             or self.steering.vector_method in (VectorMethod.SOM, VectorMethod.SAE)
             or self.iterative.enabled
         )
-        runtime_hook_modes = {
-            SteeringMode.ANGULAR,
+        unsupported_rank_k_hook_modes = {
             SteeringMode.ADAPTIVE_ANGULAR,
             SteeringMode.SPHERICAL,
             SteeringMode.VECTOR_FIELD,
         }
-        if rank_k_recipe and self.steering.steering_mode in runtime_hook_modes:
+        if (
+            rank_k_recipe
+            and self.steering.steering_mode in unsupported_rank_k_hook_modes
+        ):
             raise ValueError(
-                "Rank-k steering recipes are not implemented for runtime hook "
+                "Rank-k steering recipes are not implemented for this runtime hook "
                 f"mode {self.steering.steering_mode.value!r}; use steering_mode="
-                "'lora' or dense steering_mode='direct'."
+                "'angular', 'concept_gated_angular' with positive alignment "
+                "disabled, 'lora', or dense steering_mode='direct'."
+            )
+        if (
+            rank_k_recipe
+            and self.steering.steering_mode == SteeringMode.CONCEPT_GATED_ANGULAR
+            and self.steering.concept_gate_positive_alignment_only
+        ):
+            raise ValueError(
+                "Rank-k concept_gated_angular uses a sign-arbitrary subspace, "
+                "so concept_gate_positive_alignment_only must be false."
+            )
+        if self.steering.concept_gate_direction_router:
+            if self.steering.steering_mode != SteeringMode.CONCEPT_GATED_ANGULAR:
+                raise ValueError(
+                    "concept_gate_direction_router requires "
+                    "steering_mode='concept_gated_angular'."
+                )
+            if self.steering.concept_gate_scope != "global_prompt":
+                raise ValueError(
+                    "concept_gate_direction_router requires "
+                    "concept_gate_scope='global_prompt'."
+                )
+            if self.steering.n_directions < 2:
+                raise ValueError(
+                    "concept_gate_direction_router requires n_directions >= 2."
+                )
+        if self.steering.search_concept_gate_fixed_direction:
+            if self.steering.n_directions < 2:
+                raise ValueError(
+                    "search_concept_gate_fixed_direction requires "
+                    "n_directions >= 2."
+                )
+            if self.steering.concept_gate_direction_router:
+                raise ValueError(
+                    "fixed-direction search and direction router are mutually "
+                    "exclusive."
+                )
+        if (
+            self.steering.concept_gate_fixed_direction_index
+            >= self.steering.n_directions
+        ):
+            raise ValueError(
+                "concept_gate_fixed_direction_index must be smaller than "
+                "n_directions."
+            )
+        failure_fields = (
+            self.steering.calibration_failure_refusal_indices,
+            self.steering.calibration_failure_compliance_indices,
+            self.steering.calibration_failure_alphas,
+        )
+        if any(failure_fields) and not all(failure_fields):
+            raise ValueError(
+                "calibration failure variants require refusal indices, "
+                "compliance indices, and alpha values together."
+            )
+        if all(failure_fields):
+            refusal_set = set(self.steering.calibration_failure_refusal_indices)
+            compliance_set = set(
+                self.steering.calibration_failure_compliance_indices
+            )
+            if refusal_set & compliance_set:
+                raise ValueError(
+                    "calibration failure refusal/compliance indices must be disjoint."
+                )
+            if min(refusal_set | compliance_set) < 0:
+                raise ValueError("calibration failure indices must be non-negative.")
+            if self.steering.search_harmfulness_direction:
+                raise ValueError(
+                    "calibration failure variants and harmfulness-direction "
+                    "search are mutually exclusive."
+                )
+        if (
+            self.steering.renormalized_primary_probe_repeats
+            and any(failure_fields)
+        ):
+            raise ValueError(
+                "renormalized-primary and calibration-failure probes are "
+                "mutually exclusive."
             )
         if rank_k_recipe and self.steering.steering_mode == SteeringMode.DIRECT:
             if (

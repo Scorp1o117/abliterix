@@ -30,9 +30,16 @@ This is a *static* alignment heuristic, not the activation-patching probe
 the paper uses; we trade a small loss in localisation precision for ~10 ⁴×
 speedup, which is acceptable for an automated abliteration sweep.
 
+bitsandbytes 4-bit
+------------------
+``Params4bit`` stores packed uint8 data — in-place float column scaling
+would corrupt it. Identify dequantises read-only; apply dequantises →
+edits → requantises and replaces ``base.weight`` (original Parameter kept
+for :func:`restore_cliff_head_ablation`).
+
 Reversibility
 -------------
-Original weight slices are cached on the engine in
+Original weight slices / Parameters are cached on the engine in
 ``engine._cliff_head_originals`` so :func:`restore` can roll them back —
 the same mechanism direct-mode steering already uses.
 """
@@ -55,16 +62,16 @@ class HeadScore:
 
 
 # ---------------------------------------------------------------------------
-# Model-shape discovery
+# Model-shape discovery / weight helpers
 # ---------------------------------------------------------------------------
 
 
 def _get_head_dim(engine) -> tuple[int, int]:
     """Return ``(num_attention_heads, head_dim)`` for the engine's model.
 
-    Reads ``num_attention_heads`` / ``hidden_size`` from the model config,
-    falling back to ``head_dim`` if the model exposes it directly (some
-    MLA / MoE configs). Raises on missing attributes — cliff-head ablation
+    Prefer ``v_head_dim`` when present (MLA ``dense`` / o_proj columns are
+    ``num_heads * v_head_dim``). Falls back to ``head_dim`` or
+    ``hidden_size // num_heads``. Raise on missing attributes — cliff-head
     cannot proceed without head-level addressing.
     """
     cfg = getattr(engine.model, "config", None)
@@ -80,16 +87,102 @@ def _get_head_dim(engine) -> tuple[int, int]:
             "architecture."
         )
 
+    # o_proj / dense columns track value head width on MLA hybrids (Bailing).
+    v_head_dim = getattr(text_cfg, "v_head_dim", None)
     head_dim = getattr(text_cfg, "head_dim", None)
-    if head_dim is None:
+    if v_head_dim is not None:
+        head_dim = int(v_head_dim)
+    elif head_dim is None:
         hidden = getattr(text_cfg, "hidden_size", None)
         if hidden is None:
             raise RuntimeError(
-                "Cannot infer head_dim: neither head_dim nor hidden_size is "
-                "set on the model config."
+                "Cannot infer head_dim: neither v_head_dim, head_dim, nor "
+                "hidden_size is set on the model config."
             )
         head_dim = hidden // num_heads
     return int(num_heads), int(head_dim)
+
+
+def _resolve_head_dim(
+    in_features: int,
+    num_heads: int,
+    config_head_dim: int,
+    *,
+    alt_dims: Iterable[int] | None = None,
+) -> int | None:
+    """Pick a column width that tiles ``o_proj.in_features``.
+
+    Prefer the primary config value when ``in_features == num_heads * dim``.
+    Otherwise try any alternate dims from the model config (e.g. switch
+    between ``v_head_dim`` and ``head_dim`` on hybrids). Return ``None``
+    when no configured dim matches — never invent a width from
+    ``in_features // num_heads`` alone (that would mis-slice GQA / odd
+    projections).
+    """
+    candidates: list[int] = [config_head_dim]
+    if alt_dims is not None:
+        for d in alt_dims:
+            d_int = int(d)
+            if d_int not in candidates:
+                candidates.append(d_int)
+    for dim in candidates:
+        if dim > 0 and in_features == num_heads * dim:
+            return dim
+    return None
+
+
+def _weight_as_float32(weight) -> Tensor:
+    """Return a float32 view of ``weight`` for scoring / float edits.
+
+    Dequantises bitsandbytes 4-bit / int8 packed storage. Does **not**
+    write back — callers that need a persistent edit must requantise.
+    """
+    qs = getattr(weight, "quant_state", None)
+    if qs is not None:
+        try:
+            import bitsandbytes as bnb
+        except ImportError as exc:  # pragma: no cover - env dependent
+            raise RuntimeError(
+                "bitsandbytes is required to dequantize 4-bit o_proj weights "
+                "for cliff-head ablation."
+            ) from exc
+        return bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
+            weight.data, qs
+        ).to(torch.float32)
+
+    CB = getattr(weight, "CB", None)
+    if CB is not None:
+        scb = getattr(weight, "SCB", None)
+        if scb is None:
+            raise RuntimeError("int8 weight has CB but no SCB scale buffer.")
+        return CB.float() * scb.float().unsqueeze(1) / 127.0
+
+    return weight.detach().to(torch.float32)
+
+
+def _is_quantized_weight(weight) -> bool:
+    return (
+        getattr(weight, "quant_state", None) is not None
+        or getattr(weight, "CB", None) is not None
+    )
+
+
+def _requantize_4bit(W_float: Tensor, *, quant_type: str, device) -> torch.nn.Parameter:
+    """Pack a float matrix back into a ``Params4bit`` on ``device``."""
+    try:
+        import bitsandbytes as bnb
+        from bitsandbytes.nn import Params4bit
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "bitsandbytes is required to requantize cliff-head o_proj edits."
+        ) from exc
+
+    # Match common HF bnb load dtype; float16 is fine for NF4 packing input.
+    src = W_float.detach().to(device=device, dtype=torch.float16).contiguous()
+    q, st = bnb.functional.quantize_4bit(src, quant_type=quant_type)
+    param = Params4bit(q, requires_grad=False, quant_type=quant_type)
+    param.quant_state = st
+    return param
 
 
 def _refusal_vector_at_layer(refusal_vector: Tensor, layer_idx: int) -> Tensor:
@@ -141,8 +234,16 @@ def identify_safety_heads(
         Sorted by score descending (most refusal-aligned first), truncated
         to the requested fraction.
     """
-    num_heads, head_dim = _get_head_dim(engine)
+    num_heads, config_head_dim = _get_head_dim(engine)
     n_layers = engine.get_n_layers()
+    cfg = getattr(engine.model, "config", None)
+    text_cfg = getattr(cfg, "text_config", cfg) if cfg is not None else None
+    alt_dims: list[int] = []
+    if text_cfg is not None:
+        for name in ("head_dim", "v_head_dim"):
+            val = getattr(text_cfg, name, None)
+            if val is not None:
+                alt_dims.append(int(val))
 
     scores: list[HeadScore] = []
     for layer_idx in range(n_layers):
@@ -153,22 +254,27 @@ def identify_safety_heads(
         o_proj = o_proj_list[0]
 
         base = o_proj.base_layer if hasattr(o_proj, "base_layer") else o_proj
-        W = base.weight  # (hidden_out, num_heads * head_dim)
+        weight = base.weight
+
+        try:
+            W32 = _weight_as_float32(weight)
+        except RuntimeError:
+            # Unreadable quant layout — skip layer rather than crash the run.
+            continue
+
+        if W32.ndim != 2:
+            continue
+
+        out_features, in_features = W32.shape
+        head_dim = _resolve_head_dim(
+            in_features, num_heads, config_head_dim, alt_dims=alt_dims
+        )
+        if head_dim is None:
+            continue
 
         v_layer = _refusal_vector_at_layer(refusal_vector, layer_idx)
-        v = v_layer.to(W.device).to(torch.float32)
-
-        # W in float32 for the per-head projection. Keep it on whatever
-        # device the parameter lives on to avoid cross-device transfers.
-        W32 = W.detach().to(torch.float32)
-        out_features, in_features = W32.shape
-
-        # Tolerate models where attention head count × head_dim does not
-        # divide o_proj.in_features evenly (some GQA variants, some MoE
-        # attention modules). Fall back to skipping the layer in that case
-        # rather than slicing wrong.
-        if in_features != num_heads * head_dim:
-            continue
+        # Align device with the dequant matrix (may be CPU for some paths).
+        v = v_layer.to(device=W32.device, dtype=torch.float32)
 
         # Project the refusal direction through each head's column block.
         # head_cols shape: (out_features, head_dim).
@@ -218,13 +324,26 @@ def apply_cliff_head_ablation(
 
     Side effects
     ------------
-    Caches original weight slices in ``engine._cliff_head_originals`` so
+    Caches original weight slices (float path) or original Parameters
+    (bnb path) in ``engine._cliff_head_originals`` so
     :func:`restore_cliff_head_ablation` can roll back.
+
+    For bitsandbytes 4-bit ``o_proj`` weights the module is dequantised,
+    columns are scaled, then re-quantised and reassigned — packed uint8
+    storage is never edited in place.
     """
     if strength <= 0.0:
         return 0
 
-    num_heads, head_dim = _get_head_dim(engine)
+    num_heads, config_head_dim = _get_head_dim(engine)
+    cfg = getattr(engine.model, "config", None)
+    text_cfg = getattr(cfg, "text_config", cfg) if cfg is not None else None
+    alt_dims: list[int] = []
+    if text_cfg is not None:
+        for name in ("head_dim", "v_head_dim"):
+            val = getattr(text_cfg, name, None)
+            if val is not None:
+                alt_dims.append(int(val))
 
     if not hasattr(engine, "_cliff_head_originals"):
         engine._cliff_head_originals = {}
@@ -235,49 +354,108 @@ def apply_cliff_head_ablation(
         by_layer[entry.layer].append(entry.head)
 
     n_modified = 0
+    touched_quant_modules = False
+
     for layer_idx, heads in by_layer.items():
         modules = engine.steerable_modules(layer_idx)
         for o_proj in modules.get("attn.o_proj", []):
             base = o_proj.base_layer if hasattr(o_proj, "base_layer") else o_proj
             weight = base.weight
-            in_features = weight.shape[1]
-            if in_features != num_heads * head_dim:
+
+            try:
+                W32 = _weight_as_float32(weight)
+            except RuntimeError:
                 continue
 
-            data = weight.data
-            for head in heads:
-                lo = head * head_dim
-                hi = lo + head_dim
-                # Cache the slice keyed by (weight, head) so restore is O(1).
-                key = (id(weight), head)
-                if key not in engine._cliff_head_originals:
-                    engine._cliff_head_originals[key] = (
-                        weight,
-                        head,
-                        data[:, lo:hi].clone(),
-                    )
-                data[:, lo:hi] *= 1.0 - strength
-                n_modified += 1
+            if W32.ndim != 2:
+                continue
+
+            in_features = W32.shape[1]
+            head_dim = _resolve_head_dim(
+                in_features, num_heads, config_head_dim, alt_dims=alt_dims
+            )
+            if head_dim is None:
+                continue
+
+            quantized = _is_quantized_weight(weight)
+
+            if quantized:
+                # Keep the original Parameter for restore; edit a float copy.
+                mod_key = ("bnb_module", id(base))
+                if mod_key not in engine._cliff_head_originals:
+                    engine._cliff_head_originals[mod_key] = ("bnb", base, weight)
+
+                for head in heads:
+                    lo = head * head_dim
+                    hi = lo + head_dim
+                    W32[:, lo:hi] *= 1.0 - strength
+                    n_modified += 1
+
+                qs = getattr(weight, "quant_state", None)
+                quant_type = getattr(qs, "quant_type", None) or "nf4"
+                device = weight.data.device
+                base.weight = _requantize_4bit(
+                    W32, quant_type=quant_type, device=device
+                )
+                touched_quant_modules = True
+            else:
+                data = weight.data
+                for head in heads:
+                    lo = head * head_dim
+                    hi = lo + head_dim
+                    # Cache the slice keyed by (weight, head) so restore is O(1).
+                    key = (id(weight), head)
+                    if key not in engine._cliff_head_originals:
+                        engine._cliff_head_originals[key] = (
+                            weight,
+                            head,
+                            data[:, lo:hi].clone(),
+                        )
+                    data[:, lo:hi] *= 1.0 - strength
+                    n_modified += 1
+
+    # Stale dequant cache would serve pre-cliff matrices to LoRA writers.
+    if touched_quant_modules and hasattr(engine, "_dequant_cache"):
+        cache = engine._dequant_cache
+        if isinstance(cache, dict):
+            cache.clear()
+        if hasattr(engine, "_dequant_cache_bytes"):
+            engine._dequant_cache_bytes = 0
 
     return n_modified
 
 
 def restore_cliff_head_ablation(engine) -> int:
-    """Restore every cached ``o_proj`` column slice to its original values.
+    """Restore every cached ``o_proj`` column slice / Parameter.
 
-    Returns the number of slices restored. Safe to call when no ablation
-    has been applied — returns 0 in that case.
+    Returns the number of cache entries restored. Safe to call when no
+    ablation has been applied — returns 0 in that case.
     """
     cache = getattr(engine, "_cliff_head_originals", None)
     if not cache:
         return 0
-    for weight, head, original in cache.values():
-        # Re-derive head_dim from the cached slice width.
+
+    n = 0
+    for entry in cache.values():
+        # bnb path: ("bnb", base_module, original_Params4bit)
+        if (
+            isinstance(entry, tuple)
+            and len(entry) == 3
+            and entry[0] == "bnb"
+        ):
+            _, base, original_param = entry
+            base.weight = original_param
+            n += 1
+            continue
+
+        # float path: (weight, head, original_slice)
+        weight, head, original = entry
         head_dim = original.shape[1]
         lo = head * head_dim
         hi = lo + head_dim
         weight.data[:, lo:hi] = original.to(weight.dtype)
-    n = len(cache)
+        n += 1
+
     cache.clear()
     return n
 

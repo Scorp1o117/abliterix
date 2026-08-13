@@ -288,3 +288,61 @@ def test_identical_states_produce_zero_refusal():
     assert torch.allclose(
         result[0].float(), torch.zeros_like(result[0].float()), atol=1e-6
     )
+
+
+# ---------------------------------------------------------------------------
+# Exact-primary composition (Ling v57)
+# ---------------------------------------------------------------------------
+
+
+def test_compose_keeps_primary_bitwise_exact():
+    from abliterix.harmfulness import compose_exact_primary_with_harmfulness
+
+    torch.manual_seed(13)
+    primary = torch.randn(5, 16, dtype=torch.float16)
+    benign = torch.randn(12, 5, 16)
+    target = benign + torch.randn(1, 5, 16) * 0.7 + torch.randn(12, 5, 16) * 0.2
+    composed = compose_exact_primary_with_harmfulness(
+        primary, benign, target, projected_abliteration=True
+    )
+    assert composed.shape == (2, 5, 16)
+    assert composed.dtype == torch.float16
+    assert torch.equal(composed[0], primary)
+
+
+def test_compose_harmfulness_orthogonal_to_exact_primary():
+    from abliterix.harmfulness import compose_exact_primary_with_harmfulness
+
+    torch.manual_seed(17)
+    primary = F.normalize(torch.randn(6, 24), p=2, dim=1)
+    benign = torch.randn(20, 6, 24)
+    intra = F.normalize(torch.randn(1, 6, 24), p=2, dim=2)
+    target = benign + torch.randn(1, 6, 24) * 2.0 + intra * torch.randn(20, 6, 1)
+    composed = compose_exact_primary_with_harmfulness(
+        primary, benign, target, projected_abliteration=True
+    )
+    dots = (composed[0].float() * composed[1].float()).sum(dim=1).abs()
+    active = torch.linalg.vector_norm(composed[1].float(), dim=1) > 1e-4
+    assert torch.all(dots[active] < 1e-4)
+
+
+def test_compose_does_not_recompute_mean_diff_primary():
+    from abliterix.harmfulness import compose_exact_primary_with_harmfulness
+
+    torch.manual_seed(19)
+    benign = torch.randn(16, 4, 20)
+    target = benign + 3.0
+    raw_pair = extract_harm_refusal_pair(benign, target)
+    shifted_primary = F.normalize(torch.randn_like(raw_pair[0]), p=2, dim=1)
+    composed = compose_exact_primary_with_harmfulness(shifted_primary, benign, target)
+    assert torch.equal(composed[0], shifted_primary)
+    assert not torch.allclose(composed[0], raw_pair[0], atol=1e-5)
+
+
+def test_compose_rejects_shape_mismatch():
+    from abliterix.harmfulness import compose_exact_primary_with_harmfulness
+
+    with pytest.raises(ValueError, match="must match primary"):
+        compose_exact_primary_with_harmfulness(
+            torch.randn(3, 8), torch.randn(4, 2, 8), torch.randn(4, 2, 8)
+        )

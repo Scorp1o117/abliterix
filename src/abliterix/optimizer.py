@@ -87,14 +87,14 @@ def run_search(
     # ``steering_vectors`` so the categorical sample is a degenerate one-
     # choice — the search still validates without crashing.
     _variants: dict[str, "torch.Tensor"] | None = None
-    if config.steering.search_harmfulness_direction:
-        if steering_vector_variants:
-            _variants = dict(steering_vector_variants)
-        else:
-            _variants = {"single": steering_vectors}
+    if steering_vector_variants:
+        _variants = dict(steering_vector_variants)
+    elif config.steering.search_harmfulness_direction:
+        _variants = {"single": steering_vectors}
+    if _variants is not None:
         print(
-            f"[grey50]search_harmfulness_direction = true; "
-            f"variants available: {list(_variants.keys())}[/]"
+            f"[grey50]steering-vector variants available: "
+            f"{list(_variants.keys())}[/]"
         )
 
     _scope_choices = vector_scope_choices(
@@ -148,6 +148,73 @@ def run_search(
             )
             trial_decay_kernel = DecayKernel(chosen_kernel)
             trial.set_user_attr("decay_kernel", chosen_kernel)
+
+        if config.steering.search_runtime_hook_site:
+            chosen_site = trial.suggest_categorical(
+                "runtime_hook_site",
+                config.steering.runtime_hook_site_choices,
+            )
+            config.steering.runtime_hook_site = chosen_site
+            trial.set_user_attr("runtime_hook_site", chosen_site)
+
+        if config.steering.search_concept_gate_threshold:
+            gate_lo, gate_hi = config.steering.concept_gate_threshold_range
+            chosen_threshold = trial.suggest_float(
+                "concept_gate_threshold", gate_lo, gate_hi
+            )
+            config.steering.concept_gate_threshold = chosen_threshold
+            trial.set_user_attr("concept_gate_threshold", chosen_threshold)
+
+        if config.steering.search_concept_gate_angular_overrotation:
+            allow_overrotation = trial.suggest_categorical(
+                "concept_gate_angular_overrotation", [False, True]
+            )
+            config.steering.concept_gate_angular_overrotation = allow_overrotation
+            trial.set_user_attr(
+                "concept_gate_angular_overrotation", allow_overrotation
+            )
+
+        if config.steering.search_concept_gate_angular_overrotation_phase:
+            overrotation_phase = trial.suggest_categorical(
+                "concept_gate_angular_overrotation_phase",
+                ["all", "prefill", "decode"],
+            )
+            config.steering.concept_gate_angular_overrotation_phase = (
+                overrotation_phase
+            )
+            trial.set_user_attr(
+                "concept_gate_angular_overrotation_phase", overrotation_phase
+            )
+
+        if config.steering.search_concept_gate_intervention_geometry:
+            intervention_geometry = trial.suggest_categorical(
+                "concept_gate_intervention_geometry",
+                ["angular", "linear_projection"],
+            )
+            config.steering.concept_gate_intervention_geometry = (
+                intervention_geometry
+            )
+            trial.set_user_attr(
+                "concept_gate_intervention_geometry", intervention_geometry
+            )
+
+        if config.steering.search_concept_gate_refusal_prefix_retry:
+            prefix_retry = trial.suggest_categorical(
+                "concept_gate_refusal_prefix_retry",
+                [False, True],
+            )
+            config.steering.concept_gate_refusal_prefix_retry = prefix_retry
+            trial.set_user_attr(
+                "concept_gate_refusal_prefix_retry", prefix_retry
+            )
+
+        if config.steering.search_concept_gate_fixed_direction:
+            direction_index = trial.suggest_categorical(
+                "direction_index",
+                list(range(config.steering.n_directions)),
+            )
+            config.steering.concept_gate_fixed_direction_index = direction_index
+            trial.set_user_attr("direction_index", direction_index)
 
         # --- Steering-vector variant (single vs harmfulness pair) ---
         trial_variant = "single"
@@ -237,27 +304,47 @@ def run_search(
         # --- MoE expert routing (only for MoE architectures) ---
         routing: ExpertRoutingConfig | None = None
         if safety_experts is not None:
-            n_sup = trial.suggest_int(
-                "moe.n_suppress",
-                0,
-                config.experts.max_suppress,
+            exp = config.experts
+            routing_disabled = (
+                exp.max_suppress <= 0
+                and exp.router_bias_range[0] == 0
+                and exp.router_bias_range[1] == 0
+                and exp.ablation_weight_range[0] == 0
+                and exp.ablation_weight_range[1] == 0
             )
-            r_bias = trial.suggest_float(
-                "moe.router_bias",
-                config.experts.router_bias_range[0],
-                config.experts.router_bias_range[1],
-            )
-            e_weight = trial.suggest_float(
-                "moe.expert_ablation_weight",
-                config.experts.ablation_weight_range[0],
-                config.experts.ablation_weight_range[1],
-            )
-            routing = ExpertRoutingConfig(
-                n_suppress=n_sup,
-                router_bias=r_bias,
-                expert_ablation_weight=e_weight,
-            )
-            trial.set_user_attr("moe_parameters", asdict(routing))
+            if routing_disabled:
+                # Keep search space free of dummy moe.* params; pass None so
+                # multi-direction (e.g. harmfulness_pair) is allowed on MoE.
+                trial.set_user_attr(
+                    "moe_parameters",
+                    {
+                        "n_suppress": 0,
+                        "router_bias": 0.0,
+                        "expert_ablation_weight": 0.0,
+                    },
+                )
+            else:
+                n_sup = trial.suggest_int(
+                    "moe.n_suppress",
+                    0,
+                    exp.max_suppress,
+                )
+                r_bias = trial.suggest_float(
+                    "moe.router_bias",
+                    exp.router_bias_range[0],
+                    exp.router_bias_range[1],
+                )
+                e_weight = trial.suggest_float(
+                    "moe.expert_ablation_weight",
+                    exp.ablation_weight_range[0],
+                    exp.ablation_weight_range[1],
+                )
+                routing = ExpertRoutingConfig(
+                    n_suppress=n_sup,
+                    router_bias=r_bias,
+                    expert_ablation_weight=e_weight,
+                )
+                trial.set_user_attr("moe_parameters", asdict(routing))
 
         trial.set_user_attr("vector_index", vector_index)
         trial.set_user_attr(
@@ -467,10 +554,37 @@ def run_search(
             evaluator = StageEvaluator(config, engine, scorer)
             # Run prescreen before expensive KL so high-refusal trials prune early.
             prescreen_result = evaluator._run_prescreen(trial)
+            # SC117: high-refusal prescreen → (inf, inf) objectives instead of
+            # TrialPruned. PRUNED trials have values=None which crashes the
+            # multi-objective TPE estimator on resume; COMPLETE-with-inf is
+            # filtered by is_feasible and keeps the study resumable.
+            if (
+                prescreen_result is not None
+                and prescreen_result[1]
+                and trial.user_attrs.get("prescreen_class") == "high"
+            ):
+                return (float("inf"), float("inf"))
 
         print("* Evaluating...")
         kl, length_dev = scorer.measure_kl_and_coherence(engine)
         benign_responses = getattr(scorer, "_last_benign_responses", [])
+        gate_stats = getattr(engine, "_concept_gate_stats", None)
+        if gate_stats:
+            gate_active = sum(float(values[0].item()) for values in gate_stats.values())
+            gate_total = sum(float(values[1].item()) for values in gate_stats.values())
+            prescreen_active = float(trial.user_attrs.get("concept_gate_active", 0))
+            prescreen_total = float(trial.user_attrs.get("concept_gate_total", 0))
+            benign_active = gate_active - prescreen_active
+            benign_total = gate_total - prescreen_total
+            if benign_total > 0:
+                benign_gate_rate = benign_active / benign_total
+                trial.set_user_attr(
+                    "benign_eval_concept_gate_active_rate", benign_gate_rate
+                )
+                print(
+                    f"  * Benign-eval concept gate active: "
+                    f"{benign_gate_rate:.2%} of layer-tokens"
+                )
         damage_metric = getattr(scorer, "last_damage_metric", None)
         damage_metric_name = (
             damage_metric.name if damage_metric is not None else "full_distribution_kl"
@@ -482,7 +596,20 @@ def run_search(
                 f"  * [yellow]{damage_metric_name} {kl:.4f} exceeds prune threshold "
                 f"{config.kl.prune_threshold}, skipping compliance check[/]"
             )
-            raise TrialPruned()
+            # Persist measured KL even on prune so Pareto post-mortems can
+            # see the damage magnitude (low-refusal / high-KL seesaw).
+            trial.set_user_attr("kl_divergence", kl)
+            trial.set_user_attr(
+                "damage_metric",
+                {
+                    "name": damage_metric_name,
+                    "value": float(kl),
+                    "pruned": True,
+                },
+            )
+            # SC117: (inf, inf) instead of TrialPruned — keeps multi-objective
+            # TPE resumable (PRUNED trials have None values → sampler crash).
+            return (float("inf"), float("inf"))
 
         compliance_objective = None
         if use_staged:
@@ -575,6 +702,8 @@ def run_search(
         proj_cache = getattr(engine, "_projection_cache", None)
         original_direct_transform = config.steering.direct_transform
         original_decay_kernel = config.steering.decay_kernel
+        original_runtime_hook_site = config.steering.runtime_hook_site
+        original_concept_gate_threshold = config.steering.concept_gate_threshold
         in_place_cleanup_needed = bool(
             vllm_gen is not None
             and getattr(vllm_gen, "attention_editor", None) is not None
@@ -620,6 +749,10 @@ def run_search(
                         engine._current_adapter_path = None
                     config.steering.direct_transform = original_direct_transform
                     config.steering.decay_kernel = original_decay_kernel
+                    config.steering.runtime_hook_site = original_runtime_hook_site
+                    config.steering.concept_gate_threshold = (
+                        original_concept_gate_threshold
+                    )
             flush_memory()
 
     # ----------------------------------------------------------------

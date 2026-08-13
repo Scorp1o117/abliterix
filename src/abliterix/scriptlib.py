@@ -222,14 +222,17 @@ def apply_trial_artifact(config, artifact: TrialArtifact):
             raise ValueError("Trial replay artifact is missing its steering snapshot.")
         expected_fields = set(SteeringConfig.model_fields)
         actual_fields = set(saved)
-        if actual_fields != expected_fields:
-            missing = sorted(expected_fields - actual_fields)
-            unknown = sorted(actual_fields - expected_fields)
+        unknown = sorted(actual_fields - expected_fields)
+        if unknown:
             raise ValueError(
                 "Trial steering snapshot is incompatible with this Abliterix "
-                f"version (missing fields: {missing}; unknown fields: {unknown})."
+                f"version (unknown fields: {unknown})."
             )
-        config.steering = SteeringConfig.model_validate(saved)
+        # Older journals omit fields added later. Fill those from library
+        # defaults (almost always "off") so a v6 LoRA trial can still export
+        # without inheriting the current process TOML.
+        defaults = SteeringConfig().model_dump(mode="json")
+        config.steering = SteeringConfig.model_validate({**defaults, **saved})
 
         direction_inputs = artifact.recipe.get("direction_inputs")
         if isinstance(direction_inputs, dict):
@@ -301,7 +304,10 @@ def compute_trial_vectors(
         unsupported_runtime_state.append("iterative multi-pass vectors")
     if config.steering.cliff_head_ablation:
         unsupported_runtime_state.append("cliff-head edits and selected head IDs")
-    if config.steering.steering_mode == SteeringMode.VECTOR_FIELD:
+    if config.steering.steering_mode in {
+        SteeringMode.VECTOR_FIELD,
+        SteeringMode.CONCEPT_GATED_ANGULAR,
+    }:
         unsupported_runtime_state.append("trained vector-field concept scorers")
     if unsupported_runtime_state:
         details = ", ".join(unsupported_runtime_state)

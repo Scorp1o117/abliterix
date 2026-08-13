@@ -245,18 +245,40 @@ def test_apply_trial_artifact_rejects_vllm_materialization(sample_trial_attrs):
         apply_trial_artifact(config, artifact)
 
 
-def test_apply_trial_artifact_rejects_partial_versioned_snapshot(sample_trial_attrs):
+def test_apply_trial_artifact_fills_missing_legacy_steering_fields(sample_trial_attrs):
     attrs = {
         **sample_trial_attrs,
         "steering_recipe": {
             "schema_version": 1,
-            "steering": {"direct_transform": "standard"},
+            "steering": {
+                "direct_transform": "standard",
+                "weight_normalization": "full",
+                "full_norm_lora_rank": 3,
+            },
         },
     }
     config = AbliterixConfig(model={"model_id": "dummy/model"})
     artifact = extract_trial_artifact(_trial_with(attrs))
 
-    with pytest.raises(ValueError, match="incompatible"):
+    apply_trial_artifact(config, artifact)
+
+    assert config.steering.weight_normalization.value == "full"
+    assert config.steering.full_norm_lora_rank == 3
+    assert config.steering.concept_gate_refusal_prefix_retry is False
+
+
+def test_apply_trial_artifact_rejects_unknown_steering_fields(sample_trial_attrs):
+    attrs = {
+        **sample_trial_attrs,
+        "steering_recipe": {
+            "schema_version": 1,
+            "steering": {"not_a_real_steering_field": True},
+        },
+    }
+    config = AbliterixConfig(model={"model_id": "dummy/model"})
+    artifact = extract_trial_artifact(_trial_with(attrs))
+
+    with pytest.raises(ValueError, match="unknown fields"):
         apply_trial_artifact(config, artifact)
 
 

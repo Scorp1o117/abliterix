@@ -209,6 +209,73 @@ class TestAngularHook:
 
         assert torch.equal(h_new, h)
 
+    def test_rank_two_maximum_angle_removes_entire_subspace(self):
+        directions = torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0]]
+        )
+        h = torch.tensor([[[3.0, 4.0, 12.0, 0.0]]])
+        hook = _make_angular_hook(directions, angle_degrees=90.0)
+
+        h_new = hook(None, None, h)
+
+        torch.testing.assert_close(
+            h_new @ directions.T,
+            torch.zeros(1, 1, 2),
+            atol=1e-5,
+            rtol=0,
+        )
+        torch.testing.assert_close(h_new.norm(dim=-1), h.norm(dim=-1))
+
+    def test_rank_two_zero_angle_is_identity(self):
+        directions = torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+        )
+        h = torch.randn(2, 3, 4)
+
+        h_new = _make_angular_hook(directions, angle_degrees=0.0)(None, None, h)
+
+        torch.testing.assert_close(h_new, h)
+
+    def test_single_direction_preserves_legacy_operation_order_bitwise(self):
+        torch.manual_seed(41)
+        direction = torch.randn(17, dtype=torch.float16)
+        h = torch.randn(2, 5, 17, dtype=torch.float16)
+        fraction = 0.73
+
+        d = F.normalize(direction.to(h.device, dtype=h.dtype), p=2, dim=0)
+        raw_h_norm = h.norm(dim=-1, keepdim=True)
+        h_norm = raw_h_norm.clamp(min=1e-8)
+        h_hat = h / h_norm
+        projection = (h_hat @ d).unsqueeze(-1).clamp(-1.0, 1.0)
+        residual = h_hat - projection * d
+        residual_norm = residual.norm(dim=-1, keepdim=True)
+        removal_tangent = residual / residual_norm.clamp(min=1e-8)
+        fallback_axis = torch.zeros_like(d)
+        fallback_axis[d.abs().argmin()] = 1
+        fallback_tangent = F.normalize(
+            fallback_axis - (fallback_axis @ d) * d, p=2, dim=0
+        )
+        removal_tangent = torch.where(
+            residual_norm <= 1e-6, fallback_tangent, removal_tangent
+        )
+        alpha = torch.atan2(projection.abs(), residual_norm)
+        remaining = (1.0 - fraction) * alpha
+        expected = torch.where(
+            raw_h_norm == 0,
+            h,
+            h_norm
+            * (
+                projection.sign() * torch.sin(remaining) * d
+                + torch.cos(remaining) * removal_tangent
+            ),
+        )
+
+        actual = _make_angular_hook(
+            direction, angle_degrees=fraction * 90.0
+        )(None, None, h)
+
+        assert torch.equal(actual, expected)
+
 
 class TestSharedRemovalSemantics:
     """Observable invariants shared by angular and spherical modes."""

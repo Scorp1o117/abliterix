@@ -215,17 +215,23 @@ def _run_optimisation(
         _session.steering_vectors = vectors
 
         # SVF concept scorer training.
-        if config.steering.steering_mode == SM.VECTOR_FIELD:
+        if config.steering.steering_mode in {
+            SM.VECTOR_FIELD,
+            SM.CONCEPT_GATED_ANGULAR,
+        }:
             from .svf import train_concept_scorers
 
             _log("Training SVF concept scorers...")
+            n_decoder_layers = engine.get_n_layers()
+            scorer_device = next(engine.transformer_layers[0].parameters()).device
             engine._concept_scorers = train_concept_scorers(
-                benign_states,
-                target_states,
+                benign_states[:, : n_decoder_layers + 1],
+                target_states[:, : n_decoder_layers + 1],
                 hidden_dim=benign_states.shape[2],
                 n_epochs=config.steering.svf_scorer_epochs,
                 lr=config.steering.svf_scorer_lr,
                 hidden_dim_scorer=config.steering.svf_scorer_hidden,
+                device=scorer_device,
             )
 
         # MoE expert profiling.

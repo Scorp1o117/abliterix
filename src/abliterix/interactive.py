@@ -525,29 +525,67 @@ def show_interactive_results(
         if not completed:
             raise KeyboardInterrupt
 
-        # Build Pareto front on (refusals, kl_divergence).
-        ranked = sorted(
-            completed,
-            key=lambda t: (t.user_attrs["refusals"], t.user_attrs["kl_divergence"]),
-        )
+        def _trial_metrics(t):
+            """Return (refusals, kl) for menu ranking, or None if not usable.
+
+            Pruned / failed COMPLETE trials often only have (inf, inf) values and
+            never set user_attrs['refusals'] — those must not enter the Pareto
+            menu (KeyError) or be offered as export candidates.
+            """
+            ua = t.user_attrs
+            ref = ua.get("refusals")
+            kl = ua.get("kl_divergence")
+            if ref is None or kl is None:
+                vals = t.values
+                if vals is not None and len(vals) >= 2:
+                    v0, v1 = float(vals[0]), float(vals[1])
+                    if not (math.isfinite(v0) and math.isfinite(v1)):
+                        return None
+                    if kl is None:
+                        kl = v0
+                    if ref is None:
+                        # values[1] is refusal fraction in [0, 1] for multi-obj
+                        ref = (
+                            int(round(v1 * len(scorer.target_msgs)))
+                            if v1 <= 1.0
+                            else int(v1)
+                        )
+                else:
+                    return None
+            try:
+                kl_f = float(kl)
+                ref_i = int(ref)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(kl_f):
+                return None
+            return ref_i, kl_f
+
+        usable = []
+        for t in completed:
+            m = _trial_metrics(t)
+            if m is not None:
+                usable.append((t, m[0], m[1]))
+
+        # Build Pareto front on (refusals, kl_divergence) among metric-complete trials.
+        ranked = sorted(usable, key=lambda x: (x[1], x[2]))
         min_kl = math.inf
         pareto: list = []
-        for trial in ranked:
-            kl = trial.user_attrs["kl_divergence"]
-            if kl < min_kl:
-                min_kl = kl
-                pareto.append(trial)
+        for trial, ref_i, kl_f in ranked:
+            if kl_f < min_kl:
+                min_kl = kl_f
+                pareto.append((trial, ref_i, kl_f))
 
         choices = [
             Choice(
                 title=(
-                    f"[Trial {t.user_attrs['index']:>3}] "
-                    f"Refusals: {t.user_attrs['refusals']:>2}/{len(scorer.target_msgs)}, "
-                    f"KL divergence: {t.user_attrs['kl_divergence']:.4f}"
+                    f"[Trial {t.user_attrs.get('index', t.number):>3}] "
+                    f"Refusals: {ref_i:>2}/{len(scorer.target_msgs)}, "
+                    f"KL divergence: {kl_f:.4f}"
                 ),
                 value=t,
             )
-            for t in pareto
+            for t, ref_i, kl_f in pareto
         ]
         choices.append(Choice(title="Run additional trials", value="continue"))
         choices.append(Choice(title="Exit program", value=""))
@@ -555,14 +593,21 @@ def show_interactive_results(
         print()
         print("[bold green]Optimization finished![/]")
         print()
-        print(
-            "The following trials resulted in Pareto optimal combinations of refusals "
-            "and KL divergence. After selecting a trial, you will be able to save the "
-            "model, upload it to Hugging Face, or chat with it to test how well it works. "
-            "You can return to this menu later to select a different trial. "
-            "[yellow]Note that KL divergence values above 1 usually indicate significant "
-            "damage to the original model's capabilities.[/]"
-        )
+        if not pareto:
+            print(
+                "[yellow]No trials with finite refusal/KL metrics yet "
+                f"({len(completed)} COMPLETE, many pruned without full eval). "
+                "Choose [bold]Run additional trials[/] or Exit.[/]"
+            )
+        else:
+            print(
+                "The following trials resulted in Pareto optimal combinations of refusals "
+                "and KL divergence. After selecting a trial, you will be able to save the "
+                "model, upload it to Hugging Face, or chat with it to test how well it works. "
+                "You can return to this menu later to select a different trial. "
+                "[yellow]Note that KL divergence values above 1 usually indicate significant "
+                "damage to the original model's capabilities.[/]"
+            )
 
         while True:
             print()

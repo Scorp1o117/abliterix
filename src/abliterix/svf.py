@@ -56,6 +56,10 @@ def train_concept_scorers(
     n_epochs: int = 50,
     lr: float = 1e-3,
     hidden_dim_scorer: int = 256,
+    device: torch.device | str | None = None,
+    validation_benign_states: Tensor | None = None,
+    validation_target_states: Tensor | None = None,
+    seed: int = 0,
 ) -> dict[int, ConceptScorer]:
     """Train one ConceptScorer per transformer layer.
 
@@ -77,6 +81,9 @@ def train_concept_scorers(
         Learning rate.
     hidden_dim_scorer : int
         Hidden dimension for the scorer MLP.
+    device : torch.device | str | None
+        Device used for scorer training.  Defaults to the hidden-state device;
+        callers loading cached CPU residuals can explicitly select a GPU.
 
     Returns
     -------
@@ -84,31 +91,38 @@ def train_concept_scorers(
         Mapping from transformer layer index (0-based) to trained scorer.
         Index 0 corresponds to the embedding layer and is excluded.
     """
+    # Make scorer weights and shuffles independent of any RNG consumed while
+    # constructing the steering basis. This is required for direction-only
+    # paired experiments.
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
     n_layers = benign_states.shape[1]
-    device = benign_states.device
+    train_device = torch.device(device) if device is not None else benign_states.device
     scorers: dict[int, ConceptScorer] = {}
 
     for layer_idx in range(1, n_layers):  # Skip embedding layer (index 0).
-        b = benign_states[:, layer_idx, :].float()
-        t = target_states[:, layer_idx, :].float()
+        b = benign_states[:, layer_idx, :].to(train_device, dtype=torch.float32)
+        t = target_states[:, layer_idx, :].to(train_device, dtype=torch.float32)
 
         # Build dataset: benign = 0, target = 1.
         X = torch.cat([b, t], dim=0)
         y = torch.cat(
             [
-                torch.zeros(b.shape[0], 1, device=device),
-                torch.ones(t.shape[0], 1, device=device),
+                torch.zeros(b.shape[0], 1, device=train_device),
+                torch.ones(t.shape[0], 1, device=train_device),
             ]
         )
 
-        scorer = ConceptScorer(hidden_dim, hidden_dim_scorer).to(device)
+        scorer = ConceptScorer(hidden_dim, hidden_dim_scorer).to(train_device)
         optimizer = torch.optim.Adam(scorer.parameters(), lr=lr)
 
         scorer.train()
         with torch.enable_grad():
             for _epoch in range(n_epochs):
                 # Shuffle.
-                perm = torch.randperm(X.shape[0], device=device)
+                perm = torch.randperm(X.shape[0], device=train_device)
                 X_shuf, y_shuf = X[perm], y[perm]
 
                 pred = scorer(X_shuf)
@@ -120,16 +134,138 @@ def train_concept_scorers(
 
         scorer.eval()
 
-        # Report final accuracy for this layer.
+        # Select on held-out prompt groups when supplied. This is important for
+        # trajectory data, where several tokens from one prompt are correlated.
         with torch.no_grad():
             pred_labels = (scorer(X) > 0.5).float()
-            acc = (pred_labels == y).float().mean().item()
+            train_acc = (pred_labels == y).float().mean().item()
+            if validation_benign_states is not None:
+                if validation_target_states is None:
+                    raise ValueError(
+                        "validation_target_states is required with validation_benign_states"
+                    )
+                vb = validation_benign_states[:, layer_idx, :].to(
+                    train_device, dtype=torch.float32
+                )
+                vt = validation_target_states[:, layer_idx, :].to(
+                    train_device, dtype=torch.float32
+                )
+                vX = torch.cat([vb, vt], dim=0)
+                vy = torch.cat(
+                    [
+                        torch.zeros(vb.shape[0], 1, device=train_device),
+                        torch.ones(vt.shape[0], 1, device=train_device),
+                    ]
+                )
+                val_acc = ((scorer(vX) > 0.5).float() == vy).float().mean().item()
+            else:
+                val_acc = train_acc
 
-        if acc > 0.6:  # Only keep scorers that learned something useful.
+        scorer.training_metrics = {
+            "train_accuracy": train_acc,
+            "validation_accuracy": val_acc,
+        }
+
+        if val_acc > 0.6:  # Only keep scorers that generalise usefully.
             scorers[layer_idx - 1] = scorer  # Map to 0-based layer index.
 
     print(
         f"* {len(scorers)}/{n_layers - 1} layers with effective scorers "
-        f"(accuracy > 60%)"
+        f"(validation accuracy > 60%)"
     )
     return scorers
+
+
+def concept_scorer_cache_payload(
+    scorers: dict[int, ConceptScorer],
+    *,
+    cache_key: str,
+    input_dim: int,
+    hidden_dim_scorer: int,
+) -> dict:
+    """Build a CPU-only, reconstructable concept-scorer cache payload."""
+    return {
+        "cache_key": cache_key,
+        "input_dim": int(input_dim),
+        "hidden_dim_scorer": int(hidden_dim_scorer),
+        "scorers": {
+            int(layer_idx): {
+                "state_dict": {
+                    name: tensor.detach().cpu()
+                    for name, tensor in scorer.state_dict().items()
+                },
+                "training_metrics": dict(
+                    getattr(scorer, "training_metrics", {})
+                ),
+            }
+            for layer_idx, scorer in scorers.items()
+        },
+    }
+
+
+def load_concept_scorer_cache(
+    payload: dict,
+    *,
+    expected_cache_key: str,
+    device: torch.device | str,
+) -> dict[int, ConceptScorer] | None:
+    """Reconstruct cached scorers, returning ``None`` on provenance mismatch."""
+    if payload.get("cache_key") != expected_cache_key:
+        return None
+    input_dim = int(payload["input_dim"])
+    hidden_dim_scorer = int(payload["hidden_dim_scorer"])
+    scorers: dict[int, ConceptScorer] = {}
+    for raw_layer_idx, entry in payload["scorers"].items():
+        scorer = ConceptScorer(input_dim, hidden_dim_scorer).to(device)
+        scorer.load_state_dict(entry["state_dict"], strict=True)
+        scorer.training_metrics = dict(entry.get("training_metrics", {}))
+        scorer.eval()
+        scorers[int(raw_layer_idx)] = scorer
+    return scorers
+
+
+def evaluate_concept_scorers(
+    scorers: dict[int, ConceptScorer],
+    benign_states: Tensor,
+    target_states: Tensor,
+    *,
+    threshold: float = 0.5,
+) -> dict[str, float]:
+    """Summarise held-out class separation across retained layer scorers."""
+    if not scorers:
+        return {
+            "layers": 0.0,
+            "accuracy_mean": 0.0,
+            "benign_active_mean": 0.0,
+            "target_active_mean": 0.0,
+            "score_margin_mean": 0.0,
+        }
+    accuracies = []
+    benign_rates = []
+    target_rates = []
+    margins = []
+    with torch.no_grad():
+        for layer_idx, scorer in scorers.items():
+            scorer_device = next(scorer.parameters()).device
+            b = benign_states[:, layer_idx + 1, :].to(
+                scorer_device, dtype=torch.float32
+            )
+            t = target_states[:, layer_idx + 1, :].to(
+                scorer_device, dtype=torch.float32
+            )
+            b_scores = scorer(b).flatten()
+            t_scores = scorer(t).flatten()
+            b_rate = (b_scores >= threshold).float().mean().item()
+            t_rate = (t_scores >= threshold).float().mean().item()
+            accuracy = 0.5 * ((1.0 - b_rate) + t_rate)
+            accuracies.append(accuracy)
+            benign_rates.append(b_rate)
+            target_rates.append(t_rate)
+            margins.append(t_scores.mean().item() - b_scores.mean().item())
+    return {
+        "layers": float(len(scorers)),
+        "accuracy_mean": sum(accuracies) / len(accuracies),
+        "benign_active_mean": sum(benign_rates) / len(benign_rates),
+        "target_active_mean": sum(target_rates) / len(target_rates),
+        "score_margin_mean": sum(margins) / len(margins),
+    }

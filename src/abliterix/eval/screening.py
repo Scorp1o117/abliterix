@@ -12,6 +12,7 @@ and does not require any model inference.
 """
 
 import collections
+import re
 from typing import Any
 
 from ..util import print
@@ -33,13 +34,17 @@ class TrialScreener:
         self.config = config
         self.tokenizer = engine.tokenizer
         self._thinking_skip_patterns = [
-            "Thinking",
-            "思考",
             "<think>",
             "</think>",
-            "Thought",
-            "thought",
         ]
+        # Plain words such as "thinking" and "thought" occur routinely in
+        # benign prose (critical-thinking lessons, story brainstorming, etc.).
+        # Treat them as a leak only when rendered as a standalone reasoning
+        # section header, while explicit model control tags remain substring
+        # matches above.
+        self._thinking_header_re = re.compile(
+            r"(?im)^\s*(?:thinking|thought|思考)\s*[:：]\s*"
+        )
 
     def check_generation_health(self, responses: list[str]) -> dict[str, Any]:
         """Analyse ngram repetition, token frequency, and consecutive repeats.
@@ -175,6 +180,8 @@ class TrialScreener:
             for pattern in patterns:
                 if pattern.lower() in lower:
                     return True
+            if self._thinking_header_re.search(resp):
+                return True
         return False
 
     def print_screening_report(self, report: dict[str, Any]) -> None:

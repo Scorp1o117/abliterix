@@ -27,6 +27,18 @@ def test_search_direct_transform_default_off():
     assert cfg.search_direct_transform_choices == ["standard", "orba", "biprojected"]
 
 
+def test_concept_gate_overrotation_defaults_to_legacy_clamp():
+    from abliterix.settings import SteeringConfig
+
+    cfg = SteeringConfig()
+    assert cfg.concept_gate_angular_overrotation is False
+    assert cfg.search_concept_gate_angular_overrotation is False
+    assert cfg.concept_gate_angular_overrotation_phase == "all"
+    assert cfg.search_concept_gate_angular_overrotation_phase is False
+    assert cfg.concept_gate_intervention_geometry == "angular"
+    assert cfg.search_concept_gate_intervention_geometry is False
+
+
 def test_search_direct_transform_choices_overridable():
     from abliterix.settings import SteeringConfig
 
@@ -153,14 +165,85 @@ def test_single_direction_search_keeps_global_and_per_layer_choices():
     ]
 
 
-@pytest.mark.parametrize(
-    "mode", ["angular", "adaptive_angular", "spherical", "vector_field"]
-)
+@pytest.mark.parametrize("mode", ["adaptive_angular", "spherical", "vector_field"])
 def test_runtime_hook_modes_reject_rank_k_recipes(mode):
     with pytest.raises(ValueError, match="runtime hook"):
         AbliterixConfig(
             model={"model_id": "test/model"},
             steering={"steering_mode": mode, "n_directions": 2},
+        )
+
+
+def test_rank_k_angular_is_available_for_hf():
+    config = AbliterixConfig(
+        model={"model_id": "test/model"},
+        steering={"steering_mode": "angular", "n_directions": 2},
+    )
+
+    assert config.steering.n_directions == 2
+
+
+def test_rank_k_concept_gate_requires_sign_agnostic_removal():
+    with pytest.raises(ValueError, match="positive_alignment_only must be false"):
+        AbliterixConfig(
+            model={"model_id": "test/model"},
+            steering={"steering_mode": "concept_gated_angular", "n_directions": 2},
+        )
+
+    config = AbliterixConfig(
+        model={"model_id": "test/model"},
+        steering={
+            "steering_mode": "concept_gated_angular",
+            "n_directions": 2,
+            "concept_gate_positive_alignment_only": False,
+        },
+    )
+    assert config.steering.n_directions == 2
+
+
+def test_direction_router_requires_rank_k_global_concept_gate():
+    with pytest.raises(ValueError, match="n_directions >= 2"):
+        AbliterixConfig(
+            model={"model_id": "test/model"},
+            steering={
+                "steering_mode": "concept_gated_angular",
+                "concept_gate_scope": "global_prompt",
+                "concept_gate_positive_alignment_only": False,
+                "concept_gate_direction_router": True,
+            },
+        )
+
+    config = AbliterixConfig(
+        model={"model_id": "test/model"},
+        steering={
+            "steering_mode": "concept_gated_angular",
+            "concept_gate_scope": "global_prompt",
+            "concept_gate_positive_alignment_only": False,
+            "concept_gate_direction_router": True,
+            "n_directions": 2,
+        },
+    )
+    assert config.steering.concept_gate_direction_router
+
+
+def test_fixed_direction_search_requires_rank_k_and_excludes_router():
+    with pytest.raises(ValueError, match="n_directions >= 2"):
+        AbliterixConfig(
+            model={"model_id": "test/model"},
+            steering={"search_concept_gate_fixed_direction": True},
+        )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        AbliterixConfig(
+            model={"model_id": "test/model"},
+            steering={
+                "steering_mode": "concept_gated_angular",
+                "concept_gate_scope": "global_prompt",
+                "concept_gate_positive_alignment_only": False,
+                "n_directions": 2,
+                "concept_gate_direction_router": True,
+                "search_concept_gate_fixed_direction": True,
+            },
         )
 
 

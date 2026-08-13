@@ -191,3 +191,74 @@ def extract_harm_refusal_pair(
             directions[i] = F.normalize(v, p=2, dim=1)
 
     return directions.to(benign_states.dtype)
+
+
+def compose_exact_primary_with_harmfulness(
+    primary: Tensor,
+    benign_states: Tensor,
+    target_states: Tensor,
+    *,
+    layer_band: tuple[float, float] = (0.3, 0.7),
+    projected_abliteration: bool = False,
+    orthogonal_projection: bool = False,
+) -> Tensor:
+    """Stack a bitwise-exact primary with Zhao harmfulness orthogonal to it.
+
+    ``extract_harm_refusal_pair`` recomputes slot 0 as a fresh mean-diff.  Ling
+    probes must keep the already-validated legacy primary untouched; only the
+    complementary intra-target PCA-1 is derived from ``train[:800]`` residuals.
+
+    Parameters
+    ----------
+    primary : Tensor
+        Shape ``(layers+1, hidden_dim)``. Copied into slot 0 without
+        renormalisation or projection.
+    benign_states, target_states : Tensor
+        Shape ``(n, layers+1, hidden_dim)``. Training residuals only.
+    layer_band : tuple[float, float]
+        Fractional mid-layer band forwarded to :func:`_harmfulness_direction`.
+    projected_abliteration, orthogonal_projection : bool
+        Applied to the harmfulness slot only. After either projection the
+        secondary is re-orthogonalised to the unit primary so the pair stays
+        complementary.
+
+    Returns
+    -------
+    Tensor
+        Shape ``(2, layers+1, hidden_dim)`` with the same dtype as ``primary``.
+    """
+    if primary.ndim != 2:
+        raise ValueError("primary must have shape (layers, hidden)")
+    if benign_states.ndim != 3 or target_states.ndim != 3:
+        raise ValueError("state tensors must have shape (n, layers, hidden)")
+    if (
+        benign_states.shape[1:] != primary.shape
+        or target_states.shape[1:] != primary.shape
+    ):
+        raise ValueError("state layer/hidden dimensions must match primary")
+
+    refusal_ref = F.normalize(primary.float(), p=2, dim=1)
+    harmfulness = _harmfulness_direction(
+        benign_states, target_states, refusal_ref, layer_band=layer_band
+    )
+
+    if projected_abliteration or orthogonal_projection:
+        benign_dir = F.normalize(benign_states.mean(dim=0).float(), p=2, dim=1)
+        harmfulness = harmfulness - torch.sum(
+            harmfulness * benign_dir, dim=1, keepdim=True
+        ) * benign_dir
+        harmfulness = harmfulness - torch.sum(
+            harmfulness * refusal_ref, dim=1, keepdim=True
+        ) * refusal_ref
+        norms = torch.linalg.vector_norm(harmfulness, dim=1, keepdim=True)
+        harmfulness = torch.where(
+            norms > 1e-6,
+            harmfulness / norms.clamp(min=1e-6),
+            torch.zeros_like(harmfulness),
+        )
+
+    composed = primary.new_empty((2, *primary.shape))
+    composed[0] = primary
+    composed[1] = harmfulness.to(dtype=primary.dtype)
+    return composed
+

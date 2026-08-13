@@ -2,7 +2,11 @@
 
 import torch
 
-from abliterix.svf import ConceptScorer, train_concept_scorers
+from abliterix.svf import (
+    ConceptScorer,
+    evaluate_concept_scorers,
+    train_concept_scorers,
+)
 
 
 class TestConceptScorer:
@@ -106,3 +110,23 @@ class TestTrainConceptScorers:
             assert 0 <= layer_idx < n_layers, (
                 f"Layer index {layer_idx} out of range [0, {n_layers})"
             )
+
+    def test_heldout_metrics_report_class_rates(self, synthetic_states):
+        benign, target = synthetic_states
+        scorers = train_concept_scorers(
+            benign[:15],
+            target[:15],
+            hidden_dim=64,
+            n_epochs=30,
+            lr=1e-2,
+            hidden_dim_scorer=32,
+            validation_benign_states=benign[15:],
+            validation_target_states=target[15:],
+        )
+
+        metrics = evaluate_concept_scorers(
+            scorers, benign[15:], target[15:], threshold=0.5
+        )
+
+        assert metrics["layers"] == len(scorers)
+        assert metrics["target_active_mean"] > metrics["benign_active_mean"]

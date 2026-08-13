@@ -83,3 +83,62 @@ def test_hidden_state_extraction_omits_logits_limit_for_legacy_forward():
 
     assert model.called
     assert residuals.shape == (1, 2, 3)
+
+
+def test_continuation_hidden_states_mean_pool_only_response_tokens():
+    model = _LogitsLimitedModel()
+    engine = _engine(model)
+    engine._tokenize_with_continuations = lambda _messages, _texts: (
+        {"input_ids": torch.tensor([[0, 1, 2, 4], [0, 0, 3, 9]])},
+        torch.tensor([2, 1]),
+    )
+
+    residuals = engine.extract_continuation_hidden_states([], "answer")
+
+    assert residuals.shape == (2, 2, 3)
+    assert residuals[:, 0, 0].tolist() == [3.0, 9.0]
+    assert residuals[:, 1, 0].tolist() == [4.0, 10.0]
+
+
+def test_continuation_hidden_states_reject_bad_pooling():
+    engine = _engine(_LegacyModel())
+
+    try:
+        engine.extract_continuation_hidden_states([], "answer", pooling="median")
+    except ValueError as error:
+        assert "pooling" in str(error)
+    else:
+        raise AssertionError("invalid pooling must fail")
+
+
+def test_continuation_token_hidden_states_uniformly_sample_response_tokens():
+    model = _LogitsLimitedModel()
+    engine = _engine(model)
+    engine._tokenize_with_continuations = lambda _messages, _texts: (
+        {"input_ids": torch.tensor([[0, 1, 2, 3, 4], [0, 0, 0, 8, 9]])},
+        torch.tensor([4, 2]),
+    )
+
+    residuals = engine.extract_continuation_token_hidden_states(
+        [], "answer", max_tokens_per_prompt=3
+    )
+
+    assert residuals.shape == (5, 2, 3)
+    assert residuals[:, 0, 0].tolist() == [1.0, 3.0, 4.0, 8.0, 9.0]
+    assert residuals[:, 1, 0].tolist() == [2.0, 4.0, 5.0, 9.0, 10.0]
+
+
+def test_varying_continuation_token_hidden_states_select_first_tokens():
+    model = _LogitsLimitedModel()
+    engine = _engine(model)
+    engine._tokenize_with_continuations = lambda _messages, _texts: (
+        {"input_ids": torch.tensor([[0, 1, 2, 3, 4], [0, 0, 0, 8, 9]])},
+        torch.tensor([4, 2]),
+    )
+
+    residuals = engine.extract_continuation_token_hidden_states_varying(
+        [], [], max_tokens_per_prompt=2, selection="first"
+    )
+
+    assert residuals.shape == (4, 2, 3)
+    assert residuals[:, 0, 0].tolist() == [1.0, 2.0, 8.0, 9.0]

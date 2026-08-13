@@ -61,6 +61,125 @@ from .vectors import compute_configured_steering_vectors
 # ---------------------------------------------------------------------------
 
 
+def _make_steering_cache_key(config: AbliterixConfig) -> str:
+    """Return a provenance key for every input that can change directions.
+
+    Strength profiles and write-path settings are intentionally excluded: they
+    consume steering vectors but do not participate in their construction.
+    Prompt formatting, method-specific knobs, and iterative settings must be
+    included so a checkpoint can never silently reuse a vector from a different
+    direction experiment.
+    """
+    steering = config.steering
+    direction_fields = (
+        "vector_method",
+        "orthogonal_projection",
+        "projected_abliteration",
+        "winsorize_vectors",
+        "winsorize_quantile",
+        "ot_components",
+        "n_directions",
+        "response_pair_enabled",
+        "response_pair_compliance_text",
+        "response_pair_refusal_text",
+        "response_pair_pooling",
+        "ablate_harmfulness_direction",
+        "harmfulness_layer_band",
+        "sra_base_method",
+        "sra_n_atoms",
+        "sra_ridge_alpha",
+        "som_grid_h",
+        "som_grid_w",
+        "som_n_iters",
+        "som_initial_lr",
+        "som_seed",
+        "sae_path",
+        "sae_layer",
+        "sae_top_k",
+        "rdo_steps",
+        "rdo_lr",
+        "rdo_batch_size",
+        "rdo_max_prompts",
+        "rdo_lambda_ablation",
+        "rdo_lambda_addition",
+        "rdo_lambda_retain",
+        "rdo_add_layer_frac",
+        "rdo_add_scale",
+        "rdo_init",
+        "rdo_affirmative_target",
+        "rdo_refusal_target",
+        "rdo_seed",
+    )
+    payload = {
+        "schema_version": 2,
+        "model_id": config.model.model_id,
+        "system_prompt": config.system_prompt,
+        "benign": config.benign_prompts.model_dump(mode="json"),
+        "target": config.target_prompts.model_dump(mode="json"),
+        "direction": {
+            name: getattr(steering, name).value
+            if hasattr(getattr(steering, name), "value")
+            else getattr(steering, name)
+            for name in direction_fields
+        },
+        "iterative": config.iterative.model_dump(mode="json"),
+        "seed": config.seed,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _make_concept_scorer_cache_key(config: AbliterixConfig) -> str:
+    """Return a direction-independent provenance key for concept scorers.
+
+    Concept scorers consume clean prompt/trajectory residuals, not the
+    steering basis.  In particular ``n_directions`` must not perturb this key:
+    paired rank-1/rank-k experiments need to share the exact same gate.
+    """
+    steering = config.steering
+    payload = {
+        "schema_version": 1,
+        "model_id": config.model.model_id,
+        "system_prompt": config.system_prompt,
+        "benign": config.benign_prompts.model_dump(mode="json"),
+        "target": config.target_prompts.model_dump(mode="json"),
+        "training_source": steering.concept_gate_training_source,
+        "trajectory_tokens_per_prompt": (
+            steering.concept_gate_trajectory_tokens_per_prompt
+        ),
+        "trajectory_validation_fraction": (
+            steering.concept_gate_trajectory_validation_fraction
+        ),
+        "generated_prompts_per_class": (
+            steering.concept_gate_generated_prompts_per_class
+        ),
+        "generated_max_new_tokens": (
+            steering.concept_gate_generated_max_new_tokens
+        ),
+        "generated_tokens_per_prompt": (
+            steering.concept_gate_generated_tokens_per_prompt
+        ),
+        "generated_prompt_state_repeats": (
+            steering.concept_gate_generated_prompt_state_repeats
+        ),
+        "response_pair_compliance_text": steering.response_pair_compliance_text,
+        "response_pair_refusal_text": steering.response_pair_refusal_text,
+        "scorer_epochs": steering.svf_scorer_epochs,
+        "scorer_lr": steering.svf_scorer_lr,
+        "scorer_hidden": steering.svf_scorer_hidden,
+        "seed": config.seed,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _expert_profiling_enabled(config: AbliterixConfig) -> bool:
+    """Whether any trial can actually modify ranked MoE experts."""
+    experts = config.experts
+    return experts.max_suppress > 0 and any(
+        value != 0.0
+        for value in (*experts.router_bias_range, *experts.ablation_weight_range)
+    )
+
+
 def _print_banner():
     v = version("abliterix")
     print(f"[magenta]█▀▀█░█▀▀▄░█░░░▀█▀░▀█▀░█▀▀░█▀▀▄░▀█▀░█░█[/]  v{v}")
@@ -612,7 +731,11 @@ def run():
     #           3) Fall back to HF pipeline parallelism (slow)
     _precomputed_benign_states = None
     _precomputed_target_states = None
-    if config.model.backend in ("vllm", "sglang") and _vllm_hidden_states_available():
+    if (
+        config.model.backend in ("vllm", "sglang")
+        and not config.steering.response_pair_enabled
+        and _vllm_hidden_states_available()
+    ):
         from .core.vllm_hidden_states import (
             extract_hidden_states_vllm,
             is_model_supported,
@@ -825,23 +948,15 @@ def run():
             config.optimization.checkpoint_dir,
             slugify_model_name(config.model.model_id) + "_steering.pt",
         )
-        _steering_cache_key = hashlib.sha256(json.dumps({
-            "model_id": config.model.model_id,
-            "benign": [config.benign_prompts.dataset, config.benign_prompts.split, config.benign_prompts.column],
-            "target": [config.target_prompts.dataset, config.target_prompts.split, config.target_prompts.column],
-            "vector_method": config.steering.vector_method.value,
-            "orthogonal_projection": config.steering.orthogonal_projection,
-            "projected_abliteration": config.steering.projected_abliteration,
-            "winsorize": config.steering.winsorize_vectors,
-            "winsorize_quantile": config.steering.winsorize_quantile,
-            "seed": config.seed,
-        }, sort_keys=True).encode()).hexdigest()[:16]
+        _steering_cache_key = _make_steering_cache_key(config)
 
         _steering_cached = False
         _cached_safety_experts = None
         if os.path.exists(_steering_cache_path):
             try:
-                _sc = torch.load(_steering_cache_path, map_location="cpu", weights_only=False)
+                _sc = torch.load(
+                    _steering_cache_path, map_location="cpu", weights_only=False
+                )
                 if _sc.get("cache_key") == _steering_cache_key:
                     benign_states = _sc["benign_states"]
                     target_states = _sc["target_states"]
@@ -859,7 +974,28 @@ def run():
         if not _steering_cached:
             print()
             print("Computing per-layer steering vectors...")
-            if _precomputed_benign_states is not None:
+            if config.steering.response_pair_enabled:
+                if len(benign_msgs) != len(target_msgs) or any(
+                    benign.user != target.user or benign.system != target.system
+                    for benign, target in zip(benign_msgs, target_msgs)
+                ):
+                    raise ValueError(
+                        "Response-pair extraction requires row-aligned identical "
+                        "benign/target ChatMessages."
+                    )
+                print("* Response-pair mode: teacher-forced compliance trajectory")
+                benign_states = engine.extract_continuation_hidden_states_batched(
+                    benign_msgs,
+                    config.steering.response_pair_compliance_text,
+                    pooling=config.steering.response_pair_pooling,
+                )
+                print("* Response-pair mode: teacher-forced refusal trajectory")
+                target_states = engine.extract_continuation_hidden_states_batched(
+                    target_msgs,
+                    config.steering.response_pair_refusal_text,
+                    pooling=config.steering.response_pair_pooling,
+                )
+            elif _precomputed_benign_states is not None:
                 print("* Using pre-extracted residuals (speculators)")
                 benign_states = _precomputed_benign_states
                 target_states = _precomputed_target_states
@@ -922,22 +1058,599 @@ def run():
             analyzer.plot_residuals()
 
         # Train SVF concept scorers if using Steering Vector Fields mode.
-        if config.steering.steering_mode == SteeringMode.VECTOR_FIELD:
-            from .svf import train_concept_scorers
+        if config.steering.steering_mode in {
+            SteeringMode.VECTOR_FIELD,
+            SteeringMode.CONCEPT_GATED_ANGULAR,
+        }:
+            from .svf import (
+                concept_scorer_cache_payload,
+                evaluate_concept_scorers,
+                load_concept_scorer_cache,
+                train_concept_scorers,
+            )
 
             print()
-            print("Training SVF concept scorers...")
-            engine._concept_scorers = train_concept_scorers(
-                benign_states,
-                target_states,
-                hidden_dim=benign_states.shape[2],
-                n_epochs=config.steering.svf_scorer_epochs,
-                lr=config.steering.svf_scorer_lr,
-                hidden_dim_scorer=config.steering.svf_scorer_hidden,
+            print("Training per-layer concept scorers...")
+            n_decoder_layers = engine.get_n_layers()
+            scorer_device = next(engine.transformer_layers[0].parameters()).device
+
+            scorer_benign_states = benign_states[:, : n_decoder_layers + 1]
+            scorer_target_states = target_states[:, : n_decoder_layers + 1]
+            validation_benign_states = None
+            validation_target_states = None
+            validation_prompt_benign_states = None
+            validation_prompt_target_states = None
+            external_prompt_benign_states = None
+            external_prompt_target_states = None
+            if config.steering.concept_gate_training_source == "response_trajectory":
+                prompt_indices = list(range(len(target_msgs)))
+                random.Random(config.seed).shuffle(prompt_indices)
+                validation_count = max(
+                    1,
+                    round(
+                        len(prompt_indices)
+                        * config.steering.concept_gate_trajectory_validation_fraction
+                    ),
+                )
+                if validation_count >= len(prompt_indices):
+                    raise ValueError(
+                        "Response-trajectory concept gate requires at least two prompts."
+                    )
+                validation_indices = set(prompt_indices[:validation_count])
+                trajectory_train_msgs = [
+                    message
+                    for index, message in enumerate(target_msgs)
+                    if index not in validation_indices
+                ]
+                trajectory_validation_msgs = [
+                    message
+                    for index, message in enumerate(target_msgs)
+                    if index in validation_indices
+                ]
+                max_tokens = config.steering.concept_gate_trajectory_tokens_per_prompt
+                print(
+                    "* Trajectory gate: extracting compliance-token training "
+                    f"states from {len(trajectory_train_msgs)} prompts"
+                )
+                scorer_benign_states = (
+                    engine.extract_continuation_token_hidden_states_batched(
+                        trajectory_train_msgs,
+                        config.steering.response_pair_compliance_text,
+                        max_tokens_per_prompt=max_tokens,
+                    )[:, : n_decoder_layers + 1]
+                )
+                print(
+                    "* Trajectory gate: extracting refusal-token training "
+                    f"states from {len(trajectory_train_msgs)} prompts"
+                )
+                scorer_target_states = (
+                    engine.extract_continuation_token_hidden_states_batched(
+                        trajectory_train_msgs,
+                        config.steering.response_pair_refusal_text,
+                        max_tokens_per_prompt=max_tokens,
+                    )[:, : n_decoder_layers + 1]
+                )
+                print(
+                    "* Trajectory gate: extracting prompt-grouped held-out "
+                    f"states from {len(trajectory_validation_msgs)} prompts"
+                )
+                validation_benign_states = (
+                    engine.extract_continuation_token_hidden_states_batched(
+                        trajectory_validation_msgs,
+                        config.steering.response_pair_compliance_text,
+                        max_tokens_per_prompt=max_tokens,
+                    )[:, : n_decoder_layers + 1]
+                )
+                validation_target_states = (
+                    engine.extract_continuation_token_hidden_states_batched(
+                        trajectory_validation_msgs,
+                        config.steering.response_pair_refusal_text,
+                        max_tokens_per_prompt=max_tokens,
+                    )[:, : n_decoder_layers + 1]
+                )
+                print(
+                    "* Trajectory samples: "
+                    f"train compliance={scorer_benign_states.shape[0]}, "
+                    f"train refusal={scorer_target_states.shape[0]}, "
+                    f"held-out compliance={validation_benign_states.shape[0]}, "
+                    f"held-out refusal={validation_target_states.shape[0]}"
+                )
+            elif (
+                config.steering.concept_gate_training_source
+                == "generated_prompt_trajectory"
+            ):
+                sample_count = config.steering.concept_gate_generated_prompts_per_class
+                if sample_count > len(benign_msgs) or sample_count > len(target_msgs):
+                    raise ValueError(
+                        "concept_gate_generated_prompts_per_class exceeds the "
+                        "available benign or harmful training prompts."
+                    )
+                validation_count = max(
+                    1,
+                    round(
+                        sample_count
+                        * config.steering.concept_gate_trajectory_validation_fraction
+                    ),
+                )
+                if validation_count >= sample_count:
+                    raise ValueError(
+                        "Generated-prompt trajectory gate requires at least one "
+                        "training and one validation prompt per class."
+                    )
+
+                def _sample_class_indices(
+                    population_size: int,
+                    seed_offset: int,
+                ) -> tuple[list[int], list[int]]:
+                    indices = list(range(population_size))
+                    random.Random(int(config.seed) + seed_offset).shuffle(indices)
+                    selected = indices[:sample_count]
+                    return selected[validation_count:], selected[:validation_count]
+
+                benign_train_indices, benign_validation_indices = _sample_class_indices(
+                    len(benign_msgs), 101
+                )
+                target_train_indices, target_validation_indices = _sample_class_indices(
+                    len(target_msgs), 202
+                )
+                benign_selected_indices = (
+                    benign_validation_indices + benign_train_indices
+                )
+                target_selected_indices = (
+                    target_validation_indices + target_train_indices
+                )
+                generated_benign_msgs = [
+                    benign_msgs[index] for index in benign_selected_indices
+                ]
+                generated_target_msgs = [
+                    target_msgs[index] for index in target_selected_indices
+                ]
+
+                generated_cache_path = os.path.join(
+                    config.optimization.checkpoint_dir,
+                    slugify_model_name(config.model.model_id)
+                    + "_generated_gate_responses.pt",
+                )
+                generated_cache_payload = {
+                    "model_id": config.model.model_id,
+                    "seed": config.seed,
+                    "max_new_tokens": (
+                        config.steering.concept_gate_generated_max_new_tokens
+                    ),
+                    "benign": [
+                        (message.system, message.user)
+                        for message in generated_benign_msgs
+                    ],
+                    "target": [
+                        (message.system, message.user)
+                        for message in generated_target_msgs
+                    ],
+                }
+                generated_cache_key = hashlib.sha256(
+                    json.dumps(
+                        generated_cache_payload,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    ).encode()
+                ).hexdigest()
+                generated_benign_responses = None
+                generated_target_responses = None
+                if os.path.exists(generated_cache_path):
+                    try:
+                        generated_cache = torch.load(
+                            generated_cache_path,
+                            map_location="cpu",
+                            weights_only=False,
+                        )
+                        if generated_cache.get("cache_key") == generated_cache_key:
+                            generated_benign_responses = generated_cache[
+                                "benign_responses"
+                            ]
+                            generated_target_responses = generated_cache[
+                                "target_responses"
+                            ]
+                            print("* Generated gate responses loaded from cache")
+                    except Exception as error:
+                        print(
+                            "* [yellow]Generated gate response cache failed "
+                            f"({error}); regenerating...[/]"
+                        )
+                if generated_benign_responses is None:
+                    max_new_tokens = (
+                        config.steering.concept_gate_generated_max_new_tokens
+                    )
+                    print(
+                        "* Generated gate: sampling "
+                        f"{sample_count} benign early trajectories"
+                    )
+                    generated_benign_responses = engine.generate_text_batched(
+                        generated_benign_msgs,
+                        skip_special_tokens=True,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=max_new_tokens,
+                        sort_by_length=True,
+                    )
+                    print(
+                        "* Generated gate: sampling "
+                        f"{sample_count} harmful early trajectories"
+                    )
+                    generated_target_responses = engine.generate_text_batched(
+                        generated_target_msgs,
+                        skip_special_tokens=True,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=max_new_tokens,
+                        sort_by_length=True,
+                    )
+                    torch.save(
+                        {
+                            "cache_key": generated_cache_key,
+                            "benign_responses": generated_benign_responses,
+                            "target_responses": generated_target_responses,
+                        },
+                        generated_cache_path,
+                    )
+                    print(f"* Generated gate responses cached → {generated_cache_path}")
+
+                benign_validation_responses = generated_benign_responses[
+                    :validation_count
+                ]
+                benign_train_responses = generated_benign_responses[validation_count:]
+                target_validation_responses = generated_target_responses[
+                    :validation_count
+                ]
+                target_train_responses = generated_target_responses[validation_count:]
+                benign_train_msgs = generated_benign_msgs[validation_count:]
+                benign_validation_msgs = generated_benign_msgs[:validation_count]
+                target_train_msgs = generated_target_msgs[validation_count:]
+                target_validation_msgs = generated_target_msgs[:validation_count]
+                max_decode_states = (
+                    config.steering.concept_gate_generated_tokens_per_prompt
+                )
+                print("* Generated gate: extracting benign early-decode states")
+                benign_train_decode_states = (
+                    engine.extract_continuation_token_hidden_states_varying_batched(
+                        benign_train_msgs,
+                        benign_train_responses,
+                        max_tokens_per_prompt=max_decode_states,
+                        selection="first",
+                    )[:, : n_decoder_layers + 1]
+                )
+                benign_validation_decode_states = (
+                    engine.extract_continuation_token_hidden_states_varying_batched(
+                        benign_validation_msgs,
+                        benign_validation_responses,
+                        max_tokens_per_prompt=max_decode_states,
+                        selection="first",
+                    )[:, : n_decoder_layers + 1]
+                )
+                print("* Generated gate: extracting harmful early-decode states")
+                target_train_decode_states = (
+                    engine.extract_continuation_token_hidden_states_varying_batched(
+                        target_train_msgs,
+                        target_train_responses,
+                        max_tokens_per_prompt=max_decode_states,
+                        selection="first",
+                    )[:, : n_decoder_layers + 1]
+                )
+                target_validation_decode_states = (
+                    engine.extract_continuation_token_hidden_states_varying_batched(
+                        target_validation_msgs,
+                        target_validation_responses,
+                        max_tokens_per_prompt=max_decode_states,
+                        selection="first",
+                    )[:, : n_decoder_layers + 1]
+                )
+
+                repeats = config.steering.concept_gate_generated_prompt_state_repeats
+                benign_train_prompt_states = benign_states[
+                    benign_train_indices, : n_decoder_layers + 1
+                ].repeat_interleave(repeats, dim=0)
+                target_train_prompt_states = target_states[
+                    target_train_indices, : n_decoder_layers + 1
+                ].repeat_interleave(repeats, dim=0)
+                validation_prompt_benign_states = benign_states[
+                    benign_validation_indices, : n_decoder_layers + 1
+                ]
+                validation_prompt_target_states = target_states[
+                    target_validation_indices, : n_decoder_layers + 1
+                ]
+                validation_benign_prompt_repeated = (
+                    validation_prompt_benign_states.repeat_interleave(repeats, dim=0)
+                )
+                validation_target_prompt_repeated = (
+                    validation_prompt_target_states.repeat_interleave(repeats, dim=0)
+                )
+                scorer_benign_states = torch.cat(
+                    [
+                        benign_train_prompt_states.cpu(),
+                        benign_train_decode_states.cpu(),
+                    ],
+                    dim=0,
+                )
+                scorer_target_states = torch.cat(
+                    [
+                        target_train_prompt_states.cpu(),
+                        target_train_decode_states.cpu(),
+                    ],
+                    dim=0,
+                )
+                validation_benign_states = torch.cat(
+                    [
+                        validation_benign_prompt_repeated.cpu(),
+                        benign_validation_decode_states.cpu(),
+                    ],
+                    dim=0,
+                )
+                validation_target_states = torch.cat(
+                    [
+                        validation_target_prompt_repeated.cpu(),
+                        target_validation_decode_states.cpu(),
+                    ],
+                    dim=0,
+                )
+                print(
+                    "* Generated gate samples: "
+                    f"train benign={scorer_benign_states.shape[0]}, "
+                    f"train harmful={scorer_target_states.shape[0]}, "
+                    f"held-out benign={validation_benign_states.shape[0]}, "
+                    f"held-out harmful={validation_target_states.shape[0]}"
+                )
+                print(
+                    "* Generated gate: extracting external evaluation "
+                    "final-prefill states"
+                )
+                external_prompt_benign_states = engine.extract_hidden_states_batched(
+                    scorer.benign_msgs
+                )[:, : n_decoder_layers + 1]
+                external_prompt_target_states = engine.extract_hidden_states_batched(
+                    scorer.target_msgs
+                )[:, : n_decoder_layers + 1]
+
+            concept_scorer_cache_path = os.path.join(
+                config.optimization.checkpoint_dir,
+                slugify_model_name(config.model.model_id) + "_concept_scorers.pt",
             )
-            print(
-                f"* Trained scorers for [bold]{len(engine._concept_scorers)}[/] layers"
-            )
+            concept_scorer_cache_key = _make_concept_scorer_cache_key(config)
+            engine._concept_scorers = None
+            if os.path.exists(concept_scorer_cache_path):
+                try:
+                    cached_payload = torch.load(
+                        concept_scorer_cache_path,
+                        map_location="cpu",
+                        weights_only=False,
+                    )
+                    engine._concept_scorers = load_concept_scorer_cache(
+                        cached_payload,
+                        expected_cache_key=concept_scorer_cache_key,
+                        device=scorer_device,
+                    )
+                    if engine._concept_scorers is not None:
+                        print(
+                            "* Concept scorers loaded from cache "
+                            f"({len(engine._concept_scorers)} layers)"
+                        )
+                except Exception as error:
+                    print(
+                        "* [yellow]Concept scorer cache failed "
+                        f"({error}); retraining...[/]"
+                    )
+            if engine._concept_scorers is None:
+                engine._concept_scorers = train_concept_scorers(
+                    scorer_benign_states,
+                    scorer_target_states,
+                    hidden_dim=scorer_benign_states.shape[2],
+                    n_epochs=config.steering.svf_scorer_epochs,
+                    lr=config.steering.svf_scorer_lr,
+                    hidden_dim_scorer=config.steering.svf_scorer_hidden,
+                    device=scorer_device,
+                    validation_benign_states=validation_benign_states,
+                    validation_target_states=validation_target_states,
+                    seed=config.seed,
+                )
+                torch.save(
+                    concept_scorer_cache_payload(
+                        engine._concept_scorers,
+                        cache_key=concept_scorer_cache_key,
+                        input_dim=scorer_benign_states.shape[2],
+                        hidden_dim_scorer=config.steering.svf_scorer_hidden,
+                    ),
+                    concept_scorer_cache_path,
+                )
+                print(
+                    f"* Trained scorers for [bold]{len(engine._concept_scorers)}[/] layers"
+                )
+                print(
+                    f"* Concept scorers cached → {concept_scorer_cache_path}"
+                )
+            if validation_benign_states is not None:
+                gate_metrics = evaluate_concept_scorers(
+                    engine._concept_scorers,
+                    validation_benign_states,
+                    validation_target_states,
+                    threshold=config.steering.concept_gate_threshold,
+                )
+                print(
+                    "* Trajectory held-out: "
+                    f"accuracy={gate_metrics['accuracy_mean']:.2%}, "
+                    f"compliance active={gate_metrics['benign_active_mean']:.2%}, "
+                    f"refusal active={gate_metrics['target_active_mean']:.2%}, "
+                    f"score margin={gate_metrics['score_margin_mean']:.4f}"
+                )
+                prompt_gate_metrics = None
+                if validation_prompt_benign_states is not None:
+                    prompt_gate_metrics = evaluate_concept_scorers(
+                        engine._concept_scorers,
+                        validation_prompt_benign_states,
+                        validation_prompt_target_states,
+                        threshold=config.steering.concept_gate_threshold,
+                    )
+                    print(
+                        "* Final-prefill held-out: "
+                        f"accuracy={prompt_gate_metrics['accuracy_mean']:.2%}, "
+                        f"benign active="
+                        f"{prompt_gate_metrics['benign_active_mean']:.2%}, "
+                        f"harmful active="
+                        f"{prompt_gate_metrics['target_active_mean']:.2%}, "
+                        f"score margin="
+                        f"{prompt_gate_metrics['score_margin_mean']:.4f}"
+                    )
+                external_gate_metrics = None
+                global_gate_metrics = None
+                if external_prompt_benign_states is not None:
+                    external_gate_metrics = evaluate_concept_scorers(
+                        engine._concept_scorers,
+                        external_prompt_benign_states,
+                        external_prompt_target_states,
+                        threshold=config.steering.concept_gate_threshold,
+                    )
+                    print(
+                        "* External final-prefill: "
+                        f"accuracy={external_gate_metrics['accuracy_mean']:.2%}, "
+                        f"benign active="
+                        f"{external_gate_metrics['benign_active_mean']:.2%}, "
+                        f"harmful active="
+                        f"{external_gate_metrics['target_active_mean']:.2%}, "
+                        f"score margin="
+                        f"{external_gate_metrics['score_margin_mean']:.4f}"
+                    )
+                    if config.steering.concept_gate_scope == "global_prompt":
+                        decision_layer = (
+                            config.steering.concept_gate_global_decision_layer
+                        )
+                        if decision_layer < 0:
+                            selection_mode = decision_layer
+                            decision_layer = -1
+                            best_selection_key = None
+                            selection_accuracy = config.steering.concept_gate_trajectory_min_validation_accuracy
+                            selection_gap = (
+                                config.steering.concept_gate_trajectory_min_active_gap
+                            )
+                            for candidate_layer in sorted(engine._concept_scorers):
+                                if (
+                                    candidate_layer
+                                    > config.steering.concept_gate_global_candidate_max_layer
+                                ):
+                                    continue
+                                candidate_metrics = evaluate_concept_scorers(
+                                    {
+                                        candidate_layer: engine._concept_scorers[
+                                            candidate_layer
+                                        ]
+                                    },
+                                    validation_prompt_benign_states,
+                                    validation_prompt_target_states,
+                                    threshold=config.steering.concept_gate_threshold,
+                                )
+                                candidate_gap = (
+                                    candidate_metrics["target_active_mean"]
+                                    - candidate_metrics["benign_active_mean"]
+                                )
+                                if (
+                                    candidate_metrics["accuracy_mean"]
+                                    >= selection_accuracy
+                                    and candidate_gap >= selection_gap
+                                ):
+                                    selection_key = (
+                                        candidate_gap,
+                                        candidate_metrics["score_margin_mean"],
+                                        -candidate_layer,
+                                    )
+                                    if (
+                                        selection_mode == -1
+                                        or best_selection_key is None
+                                        or selection_key > best_selection_key
+                                    ):
+                                        decision_layer = candidate_layer
+                                        best_selection_key = selection_key
+                                    if selection_mode == -1:
+                                        break
+                            if decision_layer < 0:
+                                raise RuntimeError(
+                                    "No global-prompt decision layer passed the "
+                                    "internal grouped validation guard."
+                                )
+                            config.steering.concept_gate_global_decision_layer = (
+                                decision_layer
+                            )
+                            print(
+                                "* Global-prompt auto-selected internal layer: "
+                                f"{decision_layer} "
+                                f"(mode={'earliest' if selection_mode == -1 else 'max-gap'})"
+                            )
+                        decision_scorer = engine._concept_scorers.get(decision_layer)
+                        if decision_scorer is None:
+                            raise RuntimeError(
+                                "Global prompt decision layer has no retained scorer: "
+                                f"{decision_layer}"
+                            )
+                        global_gate_metrics = evaluate_concept_scorers(
+                            {decision_layer: decision_scorer},
+                            external_prompt_benign_states,
+                            external_prompt_target_states,
+                            threshold=config.steering.concept_gate_threshold,
+                        )
+                        print(
+                            f"* Global-prompt layer {decision_layer} external: "
+                            f"accuracy={global_gate_metrics['accuracy_mean']:.2%}, "
+                            f"benign active="
+                            f"{global_gate_metrics['benign_active_mean']:.2%}, "
+                            f"harmful active="
+                            f"{global_gate_metrics['target_active_mean']:.2%}, "
+                            f"score margin="
+                            f"{global_gate_metrics['score_margin_mean']:.4f}"
+                        )
+                active_gap = (
+                    gate_metrics["target_active_mean"]
+                    - gate_metrics["benign_active_mean"]
+                )
+                min_accuracy = (
+                    config.steering.concept_gate_trajectory_min_validation_accuracy
+                )
+                min_active_gap = config.steering.concept_gate_trajectory_min_active_gap
+                if (
+                    gate_metrics["accuracy_mean"] < min_accuracy
+                    or active_gap < min_active_gap
+                    or (
+                        prompt_gate_metrics is not None
+                        and (
+                            prompt_gate_metrics["accuracy_mean"] < min_accuracy
+                            or (
+                                prompt_gate_metrics["target_active_mean"]
+                                - prompt_gate_metrics["benign_active_mean"]
+                            )
+                            < min_active_gap
+                        )
+                    )
+                    or (
+                        external_gate_metrics is not None
+                        and (
+                            external_gate_metrics["accuracy_mean"] < min_accuracy
+                            or (
+                                external_gate_metrics["target_active_mean"]
+                                - external_gate_metrics["benign_active_mean"]
+                            )
+                            < min_active_gap
+                        )
+                    )
+                    or (
+                        global_gate_metrics is not None
+                        and (
+                            global_gate_metrics["accuracy_mean"] < min_accuracy
+                            or (
+                                global_gate_metrics["target_active_mean"]
+                                - global_gate_metrics["benign_active_mean"]
+                            )
+                            < min_active_gap
+                        )
+                    )
+                ):
+                    raise RuntimeError(
+                        "Trajectory concept gate failed its held-out generation "
+                        "guard: "
+                        f"accuracy={gate_metrics['accuracy_mean']:.2%} "
+                        f"(required {min_accuracy:.2%}), active gap={active_gap:.2%} "
+                        f"(required {min_active_gap:.2%})."
+                    )
 
         # Cliff-head ablation (Bao et al. 2025, arXiv:2510.06036).
         # Surgically scale toward zero the o_proj columns of the attention
@@ -994,6 +1707,11 @@ def run():
         _keep_states = (
             config.steering.discriminative_layer_selection
             or config.steering.steering_mode.value != "lora"
+            # A fresh cache must retain its residual inputs until torch.save
+            # below.  Previously these were deleted first, so every cache
+            # contained benign_states=None/target_states=None and could not
+            # support provenance audits or derived direction variants.
+            or not _steering_cached
         )
         if not _keep_states:
             del benign_states, target_states
@@ -1010,7 +1728,9 @@ def run():
         safety_experts: dict[int, list[tuple[int, float]]] | None = None
         if _steering_cached and _cached_safety_experts is not None:
             safety_experts = _cached_safety_experts
-            print(f"* MoE expert profiling loaded from cache ({len(safety_experts)} layers)")
+            print(
+                f"* MoE expert profiling loaded from cache ({len(safety_experts)} layers)"
+            )
         # Only do HF router profiling when the HF model is actually loaded.
         # Under vLLM fast extraction path, engine.model is None (lightweight
         # engine) — VLLMMoEEditor does its own profiling via collective_rpc
@@ -1019,6 +1739,7 @@ def run():
             engine.model is not None
             and engine.has_expert_routing()
             and config.model.backend != "sglang"
+            and _expert_profiling_enabled(config)
         ):
             print()
             print("Profiling MoE expert activations...")
@@ -1039,14 +1760,26 @@ def run():
         # Save steering data cache
         if not _steering_cached:
             os.makedirs(config.optimization.checkpoint_dir, exist_ok=True)
-            torch.save({
-                "cache_key": _steering_cache_key,
-                "benign_states": benign_states,
-                "target_states": target_states,
-                "vectors": vectors,
-                "safety_experts": safety_experts,
-            }, _steering_cache_path)
+            torch.save(
+                {
+                    "schema_version": 2,
+                    "cache_key": _steering_cache_key,
+                    "benign_states": benign_states,
+                    "target_states": target_states,
+                    "vectors": vectors,
+                    "safety_experts": safety_experts,
+                },
+                _steering_cache_path,
+            )
             print(f"* [dim]Steering data cached → {_steering_cache_path}[/]")
+
+            if (
+                config.steering.steering_mode.value == "lora"
+                and not config.steering.discriminative_layer_selection
+            ):
+                del benign_states, target_states
+                benign_states = target_states = None
+                flush_memory()
 
         # ----- TP backend: Phase transition (vLLM or SGLang) -----
         tp_gen = None
@@ -1406,6 +2139,74 @@ def run():
                 "harmfulness_pair": pair_vectors,
             }
 
+        failure_alphas = config.steering.calibration_failure_alphas
+        if failure_alphas:
+            from .vectors import build_failure_conditioned_variants
+
+            print()
+            print(
+                "Extracting clean calibration residuals for "
+                "failure-conditioned direction variants..."
+            )
+            calibration_messages = scorer.target_msgs
+            if config.steering.calibration_failure_prompt_split is not None:
+                calibration_source = config.target_eval_prompts.model_copy(
+                    update={
+                        "split": config.steering.calibration_failure_prompt_split
+                    }
+                )
+                calibration_messages = load_prompt_dataset(
+                    config, calibration_source
+                )
+                print(
+                    "* Calibration residual split: "
+                    f"{calibration_source.split} (target eval remains "
+                    f"{config.target_eval_prompts.split})"
+                )
+            calibration_states = engine.extract_hidden_states_batched(
+                calibration_messages
+            ).cpu()
+            primary_vectors = vectors[0] if vectors.ndim == 3 else vectors
+            _vector_variants = build_failure_conditioned_variants(
+                primary_vectors.cpu(),
+                calibration_states,
+                config.steering.calibration_failure_refusal_indices,
+                config.steering.calibration_failure_compliance_indices,
+                failure_alphas,
+            )
+            repeats = config.steering.calibration_failure_variant_repeats
+            if repeats > 1:
+                repeated_variants = {}
+                for name, candidate in _vector_variants.items():
+                    if name == "primary":
+                        continue
+                    for repeat in range(repeats):
+                        repeated_variants[f"{name}_repeat_{repeat}"] = (
+                            candidate.clone()
+                        )
+                _vector_variants = repeated_variants
+            del calibration_states
+            flush_memory()
+            print(
+                "* Failure-conditioned variants: "
+                f"{list(_vector_variants.keys())}"
+            )
+
+        renormalized_repeats = (
+            config.steering.renormalized_primary_probe_repeats
+        )
+        if renormalized_repeats:
+            from .vectors import build_renormalized_primary_variants
+
+            primary_vectors = vectors[0] if vectors.ndim == 3 else vectors
+            _vector_variants = build_renormalized_primary_variants(
+                primary_vectors.cpu(), renormalized_repeats
+            )
+            print(
+                "* Renormalized-primary stability variants: "
+                f"{list(_vector_variants.keys())}"
+            )
+
         study = None
         try:
             study = run_search(
@@ -1425,7 +2226,8 @@ def run():
 
         if study is None:
             study = optuna.load_study(
-                study_name="abliterix", storage=storage,
+                study_name="abliterix",
+                storage=storage,
             )
 
         if config.non_interactive:

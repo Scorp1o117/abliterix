@@ -44,6 +44,16 @@ import transformers as _tf
 
 _dtype_kwarg = "dtype" if int(_tf.__version__.split(".")[0]) >= 5 else "torch_dtype"
 
+# transformers >= 5.x removed ``is_torch_fx_available`` from
+# ``transformers.utils.import_utils``, but 4.x-era custom-code models
+# (e.g. Ling-3.0-flash ``bailing_hybrid``, written against transformers 4.45)
+# still import it at module scope. It is only used to guard ``torch.fx.wrap``
+# on an attention-mask helper, so shimming it to False is semantically safe.
+import transformers.utils.import_utils as _tf_import_utils
+
+if not hasattr(_tf_import_utils, "is_torch_fx_available"):
+    _tf_import_utils.is_torch_fx_available = lambda: False
+
 
 # Models registered here have a known remote-config mismatch where MTP heads
 # are appended to ``layer_types`` even though ``num_hidden_layers`` describes
@@ -255,6 +265,29 @@ class _ForcedContinuationProcessor(LogitsProcessor):
         forced.scatter_(1, next_ids, 0.0)
         self.step += 1
         return forced
+
+
+class _BannedPrefixProcessor(LogitsProcessor):
+    """Ban a per-row leading token sequence on a same-batch retry pass."""
+
+    def __init__(self, banned_prefix_ids: list[list[int] | None]):
+        self.banned_prefix_ids = banned_prefix_ids
+        self.start_len: int | None = None
+
+    def __call__(self, input_ids: LongTensor, scores: FloatTensor) -> FloatTensor:
+        if scores.shape[0] != len(self.banned_prefix_ids):
+            raise RuntimeError(
+                "Banned-prefix batch changed during generation: "
+                f"expected {len(self.banned_prefix_ids)}, got {scores.shape[0]}"
+            )
+        if self.start_len is None:
+            self.start_len = int(input_ids.shape[1])
+        step = int(input_ids.shape[1]) - self.start_len
+        for row, banned in enumerate(self.banned_prefix_ids):
+            if banned is None or step < 0 or step >= len(banned):
+                continue
+            scores[row, banned[step]] = float("-inf")
+        return scores
 
 
 def _captured_logprobs(sampler: _LogitsSampler, expected_steps: int) -> Tensor:
@@ -593,9 +626,9 @@ class SteeringEngine:
                 # bnb 4-bit: promote non-quantized params (embed, norm, lm_head)
                 # to bf16 so hidden states don't overflow fp16 range in
                 # deep models.  Params4bit stores as uint8 → untouched.
-                if (
-                    config.model.quant_method == QuantMode.BNB_4BIT
-                    and dtype not in ("bfloat16", "auto")
+                if config.model.quant_method == QuantMode.BNB_4BIT and dtype not in (
+                    "bfloat16",
+                    "auto",
                 ):
                     n_conv = 0
                     for _n, _p in self.model.named_parameters():
@@ -607,6 +640,15 @@ class SteeringEngine:
                             f"  [dim]Promoted {n_conv} non-quantized params "
                             f"fp16→bf16[/]"
                         )
+
+                # bnb 4-bit: the per-tensor quantize path leaves hundreds of
+                # GB of fp16 temporaries in the PyTorch caching allocator
+                # (VRAM climbs far above the final int4 footprint during
+                # load; e.g. Ling-3.0-flash 69% -> 104GB vs 44GB of int4).
+                # Flush once after load so trials have the full budget.
+                if config.model.quant_method == QuantMode.BNB_4BIT:
+                    flush_memory()
+                    print("  [dim]bnb: flushed allocator caches after weight load[/]")
 
                 # Smoke-test: a single forward pass catches dtype-related
                 # runtime errors (inf/nan probability tensors, etc.).
@@ -643,6 +685,19 @@ class SteeringEngine:
             print("* TP backend: skipping HF LoRA adapter initialisation")
             self._lora_b_weights = []
             self.peft_config = None  # ty:ignore[invalid-assignment]
+        elif config.steering.steering_mode in {
+            SteeringMode.ANGULAR,
+            SteeringMode.ADAPTIVE_ANGULAR,
+            SteeringMode.CONCEPT_GATED_ANGULAR,
+            SteeringMode.SPHERICAL,
+            SteeringMode.VECTOR_FIELD,
+        }:
+            # Runtime hooks do not consume PEFT weights.  Avoid traversing and
+            # wrapping large fine-grained MoE trees merely to zero unused LoRA
+            # matrices on every trial.
+            self._lora_b_weights = []
+            self.peft_config = None  # ty:ignore[invalid-assignment]
+            print("* Runtime-only steering: skipped LoRA adapter initialisation")
         else:
             self._init_adapters()
         self._init_expert_routing()
@@ -699,10 +754,7 @@ class SteeringEngine:
         Falls back to the accelerate device-map path for explicit device
         maps, max_memory offload, or quantized models.
         """
-        is_fp8 = (
-            self.config.model.quant_method == QuantMode.FP8
-            or self._is_native_fp8
-        )
+        is_fp8 = self.config.model.quant_method == QuantMode.FP8 or self._is_native_fp8
         use_fast = (
             self.config.model.device_map == "auto"
             and self.max_memory is None
@@ -738,6 +790,125 @@ class SteeringEngine:
                 if key not in clones:
                     clones[key] = p.data.clone()
                 p.data = clones[key]
+        return model.to("cuda")
+
+    def _load_model_bnb_fast(
+        self,
+        model_id: str,
+        dtype: Any,
+        extra: dict[str, Any],
+    ) -> PreTrainedModel:
+        """bnb-4bit load that bypasses transformers' per-tensor quantize loop.
+
+        transformers' BitsAndBytes path quantizes every Linear weight one at
+        a time, each incurring ~0.6 s of fixed mmap/H2D overhead on ROCm —
+        for high-tensor-count models (Ling-3.0-flash: 63k tensors) that is
+        ~12 h. Instead: load BF16 via lazy mmap (~16 s), quantize all
+        weights on the CPU in parallel (``quantize_4bit`` CPU backend, 8
+        threads ≈ 12 ms/tensor), build ``Params4bit`` shells via
+        ``from_prequantized(device='cpu')``, then one bulk ``.to('cuda')``
+        which is a pure move (no re-quantization). Measured: ~17 min total
+        for a 255 GB / 63k-tensor model vs ~12 h.
+
+        Falls back to the standard bnb path when ``device_map`` is not
+        ``"auto"`` (explicit maps/offload keep the accelerate path).
+        """
+        if self.config.model.device_map != "auto":
+            return resolve_model_class(model_id).from_pretrained(
+                model_id,
+                **{_dtype_kwarg: dtype},
+                device_map=self.config.model.device_map,
+                max_memory=self.max_memory,
+                trust_remote_code=self.trusted_models.get(model_id),
+                offload_folder="/tmp/offload",
+                **extra,
+            )
+
+        print(
+            "  [dim]bnb fast load: CPU mmap -> parallel CPU quantize "
+            "-> bulk CUDA move[/]"
+        )
+        import bitsandbytes as bnb
+        from bitsandbytes.nn import Linear4bit, Params4bit
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Drop the quantization config we built for the standard path —
+        # this loader quantizes manually.
+        extra.pop("quantization_config", None)
+
+        model = resolve_model_class(model_id).from_pretrained(
+            model_id,
+            dtype="bfloat16",
+            trust_remote_code=self.trusted_models.get(model_id),
+            device_map=None,
+            low_cpu_mem_usage=True,
+            **extra,
+        )
+
+        targets = [
+            (name, mod)
+            for name, mod in model.named_modules()
+            if isinstance(mod, torch.nn.Linear)
+        ]
+        print(f"  [dim]bnb fast: quantizing {len(targets)} Linear weights on CPU[/]")
+
+        def _quantize(name_mod: tuple[str, Module]) -> tuple:
+            name, mod = name_mod
+            q, st = bnb.functional.quantize_4bit(
+                mod.weight.data,
+                blocksize=64,
+                compress_statistics=True,
+                quant_type="nf4",
+                quant_storage=torch.uint8,
+            )
+            bias = mod.bias.data.clone() if mod.bias is not None else None
+            return name, q, st.as_dict(packed=True), bias
+
+        import gc
+
+        def _swap_one(name: str, q: Tensor, st_dict: dict, bias: Tensor | None):
+            mod = model.get_submodule(name)
+            new_mod = Linear4bit(
+                mod.weight.shape[1],
+                mod.weight.shape[0],
+                bias=bias is not None,
+                compute_dtype=torch.bfloat16,
+                quant_type="nf4",
+                compress_statistics=True,
+            )
+            new_mod.weight = Params4bit.from_prequantized(
+                q, st_dict, requires_grad=False, device="cpu", module=new_mod
+            )
+            if bias is not None:
+                new_mod.bias = bias
+            if "." in name:
+                parent_name, child = name.rsplit(".", 1)
+                parent = model.get_submodule(parent_name)
+            else:
+                parent, child = model, name
+            setattr(parent, child, new_mod)
+            # Move to GPU right away (pure move for bnb_quantized
+            # Params4bit) so CPU memory never holds all int4 weights.
+            new_mod.to("cuda")
+            # Release BF16 weight pages; the targets list may still hold the
+            # original module until its slot is cleared below.
+            mod.weight.data = torch.empty(0, dtype=torch.bfloat16)
+
+        # Batched: quantize 200 weights per batch, swap immediately, drop the
+        # module refs, collect garbage. Holding all results (or letting the
+        # whole BF16 model stay referenced) pins 255 GB of mmap pages -> OOM
+        # on 128 GB hosts (observed 105 GB RSS mid-run).
+        done = 0
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for i in range(0, len(targets), 200):
+                batch = targets[i : i + 200]
+                for name, q, st_dict, bias in ex.map(_quantize, batch):
+                    _swap_one(name, q, st_dict, bias)
+                    done += 1
+                targets[i : i + 200] = [None] * len(batch)
+                gc.collect()
+        print(f"  [dim]bnb fast: quantized+swapped {done} weights[/]")
+
         return model.to("cuda")
 
     # ------------------------------------------------------------------
@@ -1002,6 +1173,15 @@ class SteeringEngine:
             if "lora_B" in name and hasattr(mod, "weight"):
                 self._lora_b_weights.append(mod.weight)
 
+        # PEFT initialises lora_B RANDOMLY. Until the first restore_baseline
+        # the model would generate through random LoRA deltas — baseline and
+        # prescreen runs would produce degenerate output (prompt echo /
+        # repetition). Zero every lora_B immediately after wrapping so the
+        # model is a faithful copy of the base weights until a trial applies
+        # its steering recipe.
+        for w in self._lora_b_weights:
+            torch.nn.init.zeros_(w)
+
         # Summarise target paths by their distinct leaf names to keep output readable.
         leaf_summary = sorted({t.rsplit(".", 1)[-1] for t in targets})
         print(
@@ -1157,6 +1337,28 @@ class SteeringEngine:
         # GatedDeltaNet linear-attention variant (Qwen3.5 MoE hybrid layers).
         with suppress(Exception):
             _register("attn.o_proj", layer.linear_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
+
+        # Bailing MoE v3 hybrid (Ling-3.0-flash, inclusionAI): decoder blocks
+        # expose attention under ``layer.attention`` (not ``self_attn``).
+        # Layers alternate MultiLatentAttention (output proj = ``dense``) and
+        # KimiDeltaAttention (output proj = ``o_proj``). Without these paths
+        # only ``mlp.down_proj`` is steerable → refusal/KL seesaw (observed
+        # Ling-only: best finite trial KL 0.46 / 43% refusals; Laguna hits
+        # KL≤0.01 / ≤10% with both o_proj + down_proj + expert routing).
+        with suppress(Exception):
+            _register("attn.o_proj", layer.attention.o_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.o_proj", layer.attention.dense)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.q_proj", layer.attention.q_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.k_proj", layer.attention.k_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.v_proj", layer.attention.v_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.q_b_proj", layer.attention.q_b_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.kv_b_proj", layer.attention.kv_b_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Dense-model MLP down-projection.
         with suppress(Exception):
@@ -1402,7 +1604,23 @@ class SteeringEngine:
             def hook(module: Module, inp: Any, out: Any):
                 with torch.no_grad():
                     if isinstance(out, tuple) and len(out) >= 3:
-                        selected = out[2]
+                        # Router output order varies by MoE family:
+                        # Bailing v3 returns (topk_idx, topk_weight, logits)
+                        # — indices FIRST — while other families return
+                        # (weights, indices, ...) with indices last. Pick
+                        # the first integral tensor as the expert-id tensor.
+                        selected = None
+                        for cand in out:
+                            if isinstance(cand, torch.Tensor) and cand.dtype in (
+                                torch.int32,
+                                torch.int64,
+                            ):
+                                selected = cand
+                                break
+                        if selected is None:
+                            selected = (
+                                out[0] if isinstance(out[0], torch.Tensor) else out[1]
+                            )
                     elif isinstance(out, tuple) and len(out) == 2:
                         selected = out[1]
                     else:
@@ -1416,8 +1634,19 @@ class SteeringEngine:
 
                     active_tokens[0][layer_idx] += n_tok
                     cnts = active_counts[0][layer_idx]
-                    for eid in flat.unique().tolist():
-                        cnts[eid] += int((flat == eid).sum().item())
+                    # Batch-count every expert in one bincount instead of
+                    # per-expert (flat == eid) GPU syncs — the per-expert
+                    # loop is catastrophically slow on 512-expert MoEs
+                    # (profiling was taking 2+ hours vs minutes).
+                    _w = getattr(module, "weight", None)
+                    if _w is not None:
+                        n_experts = _w.shape[0]
+                    else:
+                        n_experts = int(flat.max().item()) + 1
+                    bc = torch.bincount(flat.long(), minlength=n_experts).cpu().tolist()
+                    for eid, c in enumerate(bc):
+                        if c:
+                            cnts[eid] += c
 
             return hook
 
@@ -1518,7 +1747,17 @@ class SteeringEngine:
         if self.config.model.quant_method == QuantMode.FP8 or self._is_native_fp8:
             if not self._should_skip_fp8_dequant():
                 self._dequant_fp8_to_bf16()
-        self._init_adapters()
+        if self.config.steering.steering_mode in {
+            SteeringMode.ANGULAR,
+            SteeringMode.ADAPTIVE_ANGULAR,
+            SteeringMode.CONCEPT_GATED_ANGULAR,
+            SteeringMode.SPHERICAL,
+            SteeringMode.VECTOR_FIELD,
+        }:
+            self._lora_b_weights = []
+            self.peft_config = None  # ty:ignore[invalid-assignment]
+        else:
+            self._init_adapters()
         self._init_expert_routing()
         self.needs_reload = False
 
@@ -1532,6 +1771,7 @@ class SteeringEngine:
         runtime_only = {
             SteeringMode.ANGULAR,
             SteeringMode.ADAPTIVE_ANGULAR,
+            SteeringMode.CONCEPT_GATED_ANGULAR,
             SteeringMode.SPHERICAL,
             SteeringMode.VECTOR_FIELD,
         }
@@ -1668,8 +1908,9 @@ class SteeringEngine:
         if not messages:
             return []
 
+        rendered = self._render_messages(messages)
         encoded = self.tokenizer(
-            self._render_messages(messages),
+            rendered,
             padding=False,
             return_attention_mask=False,
             return_token_type_ids=False,
@@ -1681,7 +1922,17 @@ class SteeringEngine:
                 "Tokenizer returned a different number of rows while sorting "
                 f"messages: expected {len(messages)}, got {len(lengths)}"
             )
-        return sorted(range(len(messages)), key=lambda index: lengths[index])
+        return sorted(
+            range(len(messages)),
+            key=lambda index: (lengths[index], rendered[index]),
+        )
+
+    def _uses_canonical_global_prompt_batching(self) -> bool:
+        steering = self.config.steering
+        return bool(
+            getattr(steering, "concept_gate_scope", None) == "global_prompt"
+            and getattr(steering, "concept_gate_global_canonical_batching", False)
+        )
 
     @staticmethod
     def _restore_tensor_rows(values: Tensor, original_indices: list[int]) -> Tensor:
@@ -1706,9 +1957,239 @@ class SteeringEngine:
             return_token_type_ids=False,
         ).to(self.model.device)
 
+    def _tokenize_with_continuation(
+        self,
+        messages: list[ChatMessage],
+        continuation: str,
+    ) -> tuple[BatchEncoding, LongTensor]:
+        """Tokenise prompts plus a fixed assistant continuation."""
+        return self._tokenize_with_continuations(
+            messages, [continuation] * len(messages)
+        )
+
+    def _tokenize_with_continuations(
+        self,
+        messages: list[ChatMessage],
+        continuations: list[str],
+    ) -> tuple[BatchEncoding, LongTensor]:
+        """Tokenise prompts plus row-specific assistant continuations.
+
+        The tokenizer is left-padding, so each continuation occupies the final
+        ``continuation_lengths[row]`` positions even when prompt lengths differ.
+        Lengths are measured by re-tokenising the rendered prompt and full text;
+        this also handles tokenizers that merge at the assistant-text boundary.
+        """
+        if len(messages) != len(continuations):
+            raise ValueError(
+                "messages and continuations must contain the same number of rows"
+            )
+        prompt_texts = self._render_messages(messages)
+        full_texts = [
+            text + continuation
+            for text, continuation in zip(prompt_texts, continuations)
+        ]
+        prompt_rows = self.tokenizer(
+            prompt_texts,
+            padding=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )["input_ids"]
+        full_rows = self.tokenizer(
+            full_texts,
+            padding=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )["input_ids"]
+        continuation_lengths = torch.tensor(
+            [len(full) - len(prompt) for prompt, full in zip(prompt_rows, full_rows)],
+            dtype=torch.long,
+            device=self.model.device,
+        )
+        if torch.any(continuation_lengths <= 0):
+            raise RuntimeError(
+                "Teacher-forced continuation produced no additional tokens for "
+                "at least one prompt."
+            )
+        inputs = self.tokenizer(
+            full_texts,
+            return_tensors="pt",
+            padding=True,
+            return_token_type_ids=False,
+        ).to(self.model.device)
+        return inputs, continuation_lengths
+
     # ------------------------------------------------------------------
     # Generation
     # ------------------------------------------------------------------
+
+    def _uses_single_sample_global_gate_prepass(self) -> bool:
+        state = getattr(self, "_global_concept_gate_state", None)
+        return bool(
+            state is not None
+            and self.config.steering.concept_gate_scope == "global_prompt"
+            and self.config.steering.concept_gate_global_single_sample_prepass
+            and not state.get("prepass_active", False)
+        )
+
+    def _single_sample_global_prompt_gates(
+        self,
+        messages: list[ChatMessage],
+    ) -> Tensor | None:
+        """Resolve global-prompt gates in canonical batch-of-one forwards.
+
+        The decision hook stores one scalar gate in ``state['gate']``.  The
+        returned tensor is later installed as ``preset_gate`` so the actual
+        generation batch cannot recompute a different decision.
+        """
+        if not messages or not self._uses_single_sample_global_gate_prepass():
+            return None
+
+        state = self._global_concept_gate_state
+        rendered = self._render_messages(messages)
+        decision_cache = state.setdefault("decision_cache", {})
+        route_cache = state.setdefault("route_cache", {})
+        strength_feature_cache = state.setdefault("strength_feature_cache", {})
+        signed_strength_feature_cache = state.setdefault(
+            "signed_strength_feature_cache", {}
+        )
+        gate_score_cache = state.setdefault("gate_score_cache", {})
+        residual_cache = state.setdefault("prefill_residual_cache", {})
+        dump_residuals = bool(self.config.steering.dump_steered_prefill_residuals)
+        route_enabled = bool(self.config.steering.concept_gate_direction_router)
+        gates: list[Tensor] = []
+        routes: list[Tensor] = []
+        strength_features: list[Tensor] = []
+        signed_strength_features: list[Tensor] = []
+        gate_scores: list[Tensor] = []
+        state["prepass_active"] = True
+        state["preset_gate"] = None
+        try:
+            for message, cache_key in zip(messages, rendered):
+                cached = decision_cache.get(cache_key)
+                cached_route = route_cache.get(cache_key)
+                cached_feature = strength_feature_cache.get(cache_key)
+                cached_signed_feature = signed_strength_feature_cache.get(cache_key)
+                cached_gate_score = gate_score_cache.get(cache_key)
+                cached_residual = residual_cache.get(cache_key)
+                if (
+                    cached is not None
+                    and cached_feature is not None
+                    and cached_signed_feature is not None
+                    and cached_gate_score is not None
+                    and (not route_enabled or cached_route is not None)
+                    and (not dump_residuals or cached_residual is not None)
+                ):
+                    gates.append(cached.clone())
+                    strength_features.append(cached_feature.clone())
+                    signed_strength_features.append(cached_signed_feature.clone())
+                    gate_scores.append(cached_gate_score.clone())
+                    if route_enabled:
+                        routes.append(cached_route.clone())
+                    continue
+                state["gate"] = None
+                state["route"] = None
+                state["strength_feature"] = None
+                state["signed_strength_feature"] = None
+                state["gate_score"] = None
+                state["prefill_residual_layers"] = {}
+                inputs = self._tokenize([message])
+                self._reset_position_cache()
+                forward_kwargs: dict[str, Any] = {}
+                if _forward_supports_logits_to_keep(cast(Module, self.model)):
+                    forward_kwargs["logits_to_keep"] = 1
+                with torch.inference_mode():
+                    self.model(**inputs, **forward_kwargs)
+                gate = state.get("gate")
+                if gate is None or gate.shape[0] != 1:
+                    raise RuntimeError(
+                        "Single-sample global prompt gate prepass did not "
+                        "produce exactly one decision."
+                    )
+                canonical_gate = gate.detach().to(device="cpu", dtype=torch.float32)
+                decision_cache[cache_key] = canonical_gate
+                gates.append(canonical_gate.clone())
+                strength_feature = state.get("strength_feature")
+                if strength_feature is None or strength_feature.shape[0] != 1:
+                    raise RuntimeError(
+                        "Single-sample global prompt prepass did not produce "
+                        "exactly one strength-routing feature."
+                    )
+                canonical_feature = strength_feature.detach().to(
+                    device="cpu", dtype=torch.float32
+                )
+                strength_feature_cache[cache_key] = canonical_feature
+                strength_features.append(canonical_feature.clone())
+                signed_strength_feature = state.get("signed_strength_feature")
+                if (
+                    signed_strength_feature is None
+                    or signed_strength_feature.shape[0] != 1
+                ):
+                    raise RuntimeError(
+                        "Single-sample global prompt prepass did not produce "
+                        "exactly one signed strength-routing feature."
+                    )
+                canonical_signed_feature = signed_strength_feature.detach().to(
+                    device="cpu", dtype=torch.float32
+                )
+                signed_strength_feature_cache[cache_key] = canonical_signed_feature
+                signed_strength_features.append(canonical_signed_feature.clone())
+                gate_score = state.get("gate_score")
+                if gate_score is None or gate_score.shape[0] != 1:
+                    raise RuntimeError(
+                        "Single-sample global prompt prepass did not produce "
+                        "exactly one gate score."
+                    )
+                canonical_gate_score = gate_score.detach().to(
+                    device="cpu", dtype=torch.float32
+                )
+                gate_score_cache[cache_key] = canonical_gate_score
+                gate_scores.append(canonical_gate_score.clone())
+                if route_enabled:
+                    route = state.get("route")
+                    if route is None or route.shape[0] != 1:
+                        raise RuntimeError(
+                            "Single-sample direction-router prepass did not "
+                            "produce exactly one route."
+                        )
+                    canonical_route = route.detach().to(
+                        device="cpu", dtype=torch.long
+                    )
+                    route_cache[cache_key] = canonical_route
+                    routes.append(canonical_route.clone())
+                if dump_residuals:
+                    layer_residuals = state.get("prefill_residual_layers") or {}
+                    if not layer_residuals:
+                        raise RuntimeError(
+                            "Single-sample global prompt prepass did not "
+                            "produce steered prefill residuals."
+                        )
+                    hidden = next(iter(layer_residuals.values())).shape[-1]
+                    packed = torch.zeros(
+                        len(self.transformer_layers),
+                        hidden,
+                        dtype=torch.float32,
+                    )
+                    for layer_idx, residual in layer_residuals.items():
+                        packed[int(layer_idx)] = residual.reshape(residual.shape[-1])
+                    residual_cache[cache_key] = packed
+        finally:
+            state["prepass_active"] = False
+            state["gate"] = None
+            state["strength_feature"] = None
+            state["signed_strength_feature"] = None
+            state["gate_score"] = None
+            state["prefill_residual_layers"] = {}
+
+        state["prepared_routes"] = torch.cat(routes, dim=0) if routes else None
+        state["prepared_strength_features"] = torch.cat(
+            strength_features, dim=0
+        )
+        state["prepared_signed_strength_features"] = torch.cat(
+            signed_strength_features, dim=0
+        )
+        state["prepared_gate_scores"] = torch.cat(gate_scores, dim=0)
+
+        return torch.cat(gates, dim=0)
 
     def _generate(
         self,
@@ -1716,16 +2197,31 @@ class SteeringEngine:
         **kwargs: Any,
     ) -> tuple[BatchEncoding, GenerateDecoderOnlyOutput | LongTensor]:
         """Low-level generation: tokenise, run model.generate(), return (inputs, outputs)."""
+        preset_gate = self._single_sample_global_prompt_gates(messages)
+        state = getattr(self, "_global_concept_gate_state", None)
+        if preset_gate is not None:
+            state["preset_gate"] = preset_gate
+            state["gate"] = preset_gate
+            state["preset_route"] = state.pop("prepared_routes", None)
+            state["route"] = state["preset_route"]
+
         inputs = self._tokenize(messages)
         self._reset_position_cache()
 
         # ty:ignore — generate() has an extremely complex type signature.
-        outputs = self.model.generate(
-            **inputs,
-            **kwargs,
-            pad_token_id=self.tokenizer.pad_token_id,
-            do_sample=False,
-        )  # ty:ignore[call-non-callable]
+        try:
+            outputs = self.model.generate(
+                **inputs,
+                **kwargs,
+                pad_token_id=self.tokenizer.pad_token_id,
+                do_sample=False,
+            )  # ty:ignore[call-non-callable]
+        finally:
+            if preset_gate is not None:
+                state["preset_gate"] = None
+                state["gate"] = None
+                state["preset_route"] = None
+                state["route"] = None
 
         return inputs, outputs
 
@@ -1753,10 +2249,73 @@ class SteeringEngine:
                 )
             gen_kwargs["min_new_tokens"] = resolved_min
         inputs, outputs = self._generate(messages, **gen_kwargs)
-        return self.tokenizer.batch_decode(
-            outputs[:, cast(Tensor, inputs["input_ids"]).shape[1] :],
+        input_len = cast(Tensor, inputs["input_ids"]).shape[1]
+        new_tokens = outputs[:, input_len:]
+        responses = self.tokenizer.batch_decode(
+            new_tokens,
             skip_special_tokens=skip_special_tokens,
         )
+        if not self.config.steering.concept_gate_refusal_prefix_retry:
+            return responses
+
+        from ..eval.detector import RefusalDetector
+
+        detector = RefusalDetector(self.config)
+        state = getattr(self, "_global_concept_gate_state", None)
+        preset_gate = None
+        if state is not None:
+            preset_gate = self._single_sample_global_prompt_gates(messages)
+        ban_len = int(self.config.steering.concept_gate_refusal_prefix_ban_tokens)
+        banned: list[list[int] | None] = []
+        retried = 0
+        for row, response in enumerate(responses):
+            gate_on = True
+            if preset_gate is not None:
+                gate_on = bool(preset_gate[row].reshape(-1)[0].item() >= 0.5)
+            onset = detector.classify_refusal_onset(response)
+            if gate_on and bool(onset["prefix_refusal"]):
+                prefix_ids = [
+                    int(token)
+                    for token in new_tokens[row, :ban_len].tolist()
+                    if int(token) != int(self.tokenizer.pad_token_id)
+                ]
+                banned.append(prefix_ids or None)
+                retried += 1
+            else:
+                banned.append(None)
+        stats = getattr(self, "_prefix_retry_stats", None)
+        if stats is None:
+            stats = {
+                "retried": 0,
+                "still_prefix_refusal": 0,
+                "fixed_prefix": 0,
+            }
+            self._prefix_retry_stats = stats
+        stats["retried"] += retried
+        if retried == 0:
+            return responses
+
+        retry_kwargs = dict(gen_kwargs)
+        retry_kwargs["logits_processor"] = [_BannedPrefixProcessor(banned)]
+        _retry_inputs, retry_outputs = self._generate(messages, **retry_kwargs)
+        retry_tokens = retry_outputs[:, input_len:]
+        retry_responses = self.tokenizer.batch_decode(
+            retry_tokens,
+            skip_special_tokens=skip_special_tokens,
+        )
+        merged: list[str] = []
+        for row, original in enumerate(responses):
+            if banned[row] is None:
+                merged.append(original)
+                continue
+            retry_text = retry_responses[row]
+            retry_onset = detector.classify_refusal_onset(retry_text)
+            if retry_onset["prefix_refusal"]:
+                stats["still_prefix_refusal"] += 1
+            else:
+                stats["fixed_prefix"] += 1
+            merged.append(retry_text)
+        return merged
 
     def generate_text_batched(
         self,
@@ -1768,6 +2327,7 @@ class SteeringEngine:
         sort_by_length: bool = False,
     ) -> list[str]:
         """Batched generation, optionally grouped by near-equal token length."""
+        sort_by_length = sort_by_length or self._uses_canonical_global_prompt_batching()
         original_indices = (
             self._length_sorted_indices(messages)
             if sort_by_length
@@ -1853,9 +2413,15 @@ class SteeringEngine:
         min_new_tokens: int | None = None,
     ) -> tuple[list[str], Tensor]:
         """Batched wrapper around :meth:`generate_and_score`."""
+        if self._uses_canonical_global_prompt_batching():
+            original_indices = self._length_sorted_indices(messages)
+            ordered_messages = [messages[index] for index in original_indices]
+        else:
+            original_indices = list(range(len(messages)))
+            ordered_messages = messages
         all_resp: list[str] = []
         all_lp: list[Tensor] = []
-        for batch in chunk_batches(messages, self.config.inference.batch_size):
+        for batch in chunk_batches(ordered_messages, self.config.inference.batch_size):
             resp, lp = self.generate_and_score(
                 batch,
                 max_new_tokens=max_new_tokens,
@@ -1865,7 +2431,13 @@ class SteeringEngine:
             )
             all_resp.extend(resp)
             all_lp.append(lp)
-        return all_resp, torch.cat(all_lp, dim=0)
+        logprobs = torch.cat(all_lp, dim=0)
+        if original_indices == list(range(len(messages))):
+            return all_resp, logprobs
+        restored_resp = ["" for _ in all_resp]
+        for sorted_index, original_index in enumerate(original_indices):
+            restored_resp[original_index] = all_resp[sorted_index]
+        return restored_resp, self._restore_tensor_rows(logprobs, original_indices)
 
     # ------------------------------------------------------------------
     # Hidden-state extraction
@@ -1941,6 +2513,7 @@ class SteeringEngine:
         if not messages:
             raise ValueError("messages must not be empty")
 
+        sort_by_length = sort_by_length or self._uses_canonical_global_prompt_batching()
         original_indices = (
             self._length_sorted_indices(messages)
             if sort_by_length
@@ -1973,15 +2546,223 @@ class SteeringEngine:
             return residuals
         return self._restore_tensor_rows(residuals, original_indices)
 
+    def extract_continuation_hidden_states(
+        self,
+        messages: list[ChatMessage],
+        continuation: str,
+        *,
+        pooling: str = "mean",
+    ) -> Tensor:
+        """Return per-layer residuals pooled over teacher-forced response tokens."""
+        if pooling not in ("mean", "last"):
+            raise ValueError(f"Unsupported continuation pooling: {pooling!r}")
+        inputs, continuation_lengths = self._tokenize_with_continuation(
+            messages, continuation
+        )
+        self._reset_position_cache()
+        forward_kwargs: dict[str, Any] = {"output_hidden_states": True}
+        if _forward_supports_logits_to_keep(cast(Module, self.model)):
+            forward_kwargs["logits_to_keep"] = 1
+        outputs = self.model(**inputs, **forward_kwargs)
+
+        pooled_layers = []
+        for hidden in outputs.hidden_states:
+            rows = []
+            for row, length in zip(hidden, continuation_lengths.tolist()):
+                response_tokens = row[-length:, :]
+                rows.append(
+                    response_tokens.mean(dim=0)
+                    if pooling == "mean"
+                    else response_tokens[-1]
+                )
+            pooled_layers.append(torch.stack(rows, dim=0))
+        residuals = torch.stack(pooled_layers, dim=1).to(torch.float32)
+
+        q = self.config.steering.outlier_quantile
+        if 0 <= q < 1:
+            thresholds = torch.quantile(torch.abs(residuals), q, dim=2, keepdim=True)
+            residuals = torch.clamp(residuals, -thresholds, thresholds)
+        return residuals
+
+    def extract_continuation_hidden_states_batched(
+        self,
+        messages: list[ChatMessage],
+        continuation: str,
+        *,
+        pooling: str = "mean",
+    ) -> Tensor:
+        """Batched wrapper for teacher-forced continuation residuals."""
+        if not messages:
+            raise ValueError("messages must not be empty")
+        offload = getattr(self.config.inference, "offload_outputs_to_cpu", False)
+        parts = []
+        for batch in chunk_batches(messages, self.config.inference.batch_size):
+            part = self.extract_continuation_hidden_states(
+                batch, continuation, pooling=pooling
+            )
+            if offload:
+                part = part.cpu()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            parts.append(part)
+        return torch.cat(parts, dim=0)
+
+    def extract_continuation_token_hidden_states(
+        self,
+        messages: list[ChatMessage],
+        continuation: str,
+        *,
+        max_tokens_per_prompt: int = 4,
+    ) -> Tensor:
+        """Return sampled teacher-forced continuation-token residuals.
+
+        Each retained token becomes an independent row with shape
+        ``(layers+1, hidden)``. Tokens are sampled uniformly across each
+        continuation so both its early commitment and later trajectory are
+        represented without retaining the entire sequence in host memory.
+        """
+        if max_tokens_per_prompt < 1:
+            raise ValueError("max_tokens_per_prompt must be >= 1")
+        return self.extract_continuation_token_hidden_states_varying(
+            messages,
+            [continuation] * len(messages),
+            max_tokens_per_prompt=max_tokens_per_prompt,
+            selection="uniform",
+        )
+
+    def extract_continuation_token_hidden_states_varying(
+        self,
+        messages: list[ChatMessage],
+        continuations: list[str],
+        *,
+        max_tokens_per_prompt: int = 4,
+        selection: str = "first",
+    ) -> Tensor:
+        """Return token residuals for row-specific continuations."""
+        if max_tokens_per_prompt < 1:
+            raise ValueError("max_tokens_per_prompt must be >= 1")
+        if selection not in {"first", "uniform"}:
+            raise ValueError(f"Unsupported continuation token selection: {selection!r}")
+        inputs, continuation_lengths = self._tokenize_with_continuations(
+            messages, continuations
+        )
+        self._reset_position_cache()
+        forward_kwargs: dict[str, Any] = {"output_hidden_states": True}
+        if _forward_supports_logits_to_keep(cast(Module, self.model)):
+            forward_kwargs["logits_to_keep"] = 1
+        outputs = self.model(**inputs, **forward_kwargs)
+
+        token_layers = []
+        for hidden in outputs.hidden_states:
+            rows = []
+            for row, length_tensor in zip(hidden, continuation_lengths):
+                length = int(length_tensor.item())
+                response_tokens = row[-length:, :]
+                n_keep = min(length, max_tokens_per_prompt)
+                if selection == "first":
+                    indices = torch.arange(n_keep, device=row.device)
+                else:
+                    indices = (
+                        torch.linspace(
+                            0,
+                            length - 1,
+                            steps=n_keep,
+                            device=row.device,
+                        )
+                        .round()
+                        .to(torch.long)
+                        .unique(sorted=True)
+                    )
+                rows.append(response_tokens.index_select(0, indices))
+            token_layers.append(torch.cat(rows, dim=0))
+        residuals = torch.stack(token_layers, dim=1).to(torch.float32)
+
+        q = self.config.steering.outlier_quantile
+        if 0 <= q < 1:
+            thresholds = torch.quantile(torch.abs(residuals), q, dim=2, keepdim=True)
+            residuals = torch.clamp(residuals, -thresholds, thresholds)
+        return residuals
+
+    def extract_continuation_token_hidden_states_varying_batched(
+        self,
+        messages: list[ChatMessage],
+        continuations: list[str],
+        *,
+        max_tokens_per_prompt: int = 4,
+        selection: str = "first",
+    ) -> Tensor:
+        """Batched wrapper for row-specific continuation-token residuals."""
+        if not messages:
+            raise ValueError("messages must not be empty")
+        if len(messages) != len(continuations):
+            raise ValueError(
+                "messages and continuations must contain the same number of rows"
+            )
+        offload = getattr(self.config.inference, "offload_outputs_to_cpu", False)
+        parts = []
+        batch_size = self.config.inference.batch_size
+        for start in range(0, len(messages), batch_size):
+            part = self.extract_continuation_token_hidden_states_varying(
+                messages[start : start + batch_size],
+                continuations[start : start + batch_size],
+                max_tokens_per_prompt=max_tokens_per_prompt,
+                selection=selection,
+            )
+            if offload:
+                part = part.cpu()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            parts.append(part)
+        return torch.cat(parts, dim=0)
+
+    def extract_continuation_token_hidden_states_batched(
+        self,
+        messages: list[ChatMessage],
+        continuation: str,
+        *,
+        max_tokens_per_prompt: int = 4,
+    ) -> Tensor:
+        """Batched wrapper for sampled continuation-token residuals."""
+        if not messages:
+            raise ValueError("messages must not be empty")
+        offload = getattr(self.config.inference, "offload_outputs_to_cpu", False)
+        parts = []
+        for batch in chunk_batches(messages, self.config.inference.batch_size):
+            part = self.extract_continuation_token_hidden_states(
+                batch,
+                continuation,
+                max_tokens_per_prompt=max_tokens_per_prompt,
+            )
+            if offload:
+                part = part.cpu()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            parts.append(part)
+        return torch.cat(parts, dim=0)
+
     # ------------------------------------------------------------------
     # Log-probability measurement
     # ------------------------------------------------------------------
 
     def _logprobs_forward_pass(self, messages: list[ChatMessage]) -> Tensor:
         """Next-token logprobs via a single forward pass (no generation overhead)."""
+        preset_gate = self._single_sample_global_prompt_gates(messages)
+        state = getattr(self, "_global_concept_gate_state", None)
+        if preset_gate is not None:
+            state["preset_gate"] = preset_gate
+            state["gate"] = preset_gate
+            state["preset_route"] = state.pop("prepared_routes", None)
+            state["route"] = state["preset_route"]
         inputs = self._tokenize(messages)
         self._reset_position_cache()
-        outputs = self.model(**inputs)
+        try:
+            outputs = self.model(**inputs)
+        finally:
+            if preset_gate is not None:
+                state["preset_gate"] = None
+                state["gate"] = None
+                state["preset_route"] = None
+                state["route"] = None
         return F.log_softmax(outputs.logits[:, -1, :], dim=-1)
 
     def compute_logprobs(self, messages: list[ChatMessage]) -> Tensor:

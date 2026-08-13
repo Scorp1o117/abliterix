@@ -13,6 +13,7 @@ from abliterix.types import QuantMode, SteeringMode
     [
         SteeringMode.ANGULAR,
         SteeringMode.ADAPTIVE_ANGULAR,
+        SteeringMode.CONCEPT_GATED_ANGULAR,
         SteeringMode.SPHERICAL,
         SteeringMode.VECTOR_FIELD,
     ],
