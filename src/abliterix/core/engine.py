@@ -53,6 +53,9 @@ import transformers.utils.import_utils as _tf_import_utils
 
 if not hasattr(_tf_import_utils, "is_torch_fx_available"):
     _tf_import_utils.is_torch_fx_available = lambda: False
+# SC117: one-time notice when per-expert steering targets are skipped for a
+# large ModuleList MoE (see config.model.max_modulelist_experts).
+_modulelist_expert_warning_done = False
 
 
 # Models registered here have a known remote-config mismatch where MTP heads
@@ -1345,10 +1348,9 @@ class SteeringEngine:
         # only ``mlp.down_proj`` is steerable → refusal/KL seesaw (observed
         # Ling-only: best finite trial KL 0.46 / 43% refusals; Laguna hits
         # KL≤0.01 / ≤10% with both o_proj + down_proj + expert routing).
-        with suppress(Exception):
-            _register("attn.o_proj", layer.attention.o_proj)  # ty:ignore[possibly-missing-attribute]
-        with suppress(Exception):
-            _register("attn.o_proj", layer.attention.dense)  # ty:ignore[possibly-missing-attribute]
+        # Path registration order: q/k/v/o first (KDA layers expose q/k/v/o;
+        # MLA layers expose q_b/kv_b_proj + dense) — same paths either way,
+        # upstream adds explicit KDA/MLA shape comments.
         with suppress(Exception):
             _register("attn.q_proj", layer.attention.q_proj)  # ty:ignore[possibly-missing-attribute]
         with suppress(Exception):
@@ -1356,9 +1358,13 @@ class SteeringEngine:
         with suppress(Exception):
             _register("attn.v_proj", layer.attention.v_proj)  # ty:ignore[possibly-missing-attribute]
         with suppress(Exception):
+            _register("attn.o_proj", layer.attention.o_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
             _register("attn.q_b_proj", layer.attention.q_b_proj)  # ty:ignore[possibly-missing-attribute]
         with suppress(Exception):
             _register("attn.kv_b_proj", layer.attention.kv_b_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            _register("attn.o_proj", layer.attention.dense)  # ty:ignore[possibly-missing-attribute]
 
         # Dense-model MLP down-projection.
         with suppress(Exception):
@@ -1369,9 +1375,30 @@ class SteeringEngine:
         # shares the same steering profile.  Combined with discriminative
         # layer selection, only refusal-relevant experts in relevant layers
         # are actually steered — the rest are skipped.
+        #
+        # SC117: skip ModuleList experts beyond config.model.max_modulelist_experts
+        # (Ling/BailingMoeV3: 128/layer → ~3k adapters, ~9 GB bnb dequant per
+        # trial).  Attention + shared-expert steering and router suppression
+        # remain active for those layers.
         with suppress(Exception):
-            for expert in layer.mlp.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
-                _register("mlp.down_proj", expert.down_proj)  # ty:ignore[possibly-missing-attribute]
+            experts = layer.mlp.experts  # ty:ignore[possibly-missing-attribute]
+            expert_cap = self.config.model.max_modulelist_experts
+            if (
+                isinstance(experts, ModuleList)
+                and expert_cap is not None
+                and len(experts) > expert_cap
+            ):
+                global _modulelist_expert_warning_done
+                if not _modulelist_expert_warning_done:
+                    _modulelist_expert_warning_done = True
+                    print(
+                        f"* Skipping per-expert steering targets: {len(experts)} "
+                        f"experts > max_modulelist_experts={expert_cap} "
+                        "(attention + shared-expert + router suppression stay active)"
+                    )
+            else:
+                for expert in experts:  # ty:ignore[not-iterable]
+                    _register("mlp.down_proj", expert.down_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Shared expert (Qwen3 / 3.5 MoE).
         with suppress(Exception):
@@ -1568,6 +1595,35 @@ class SteeringEngine:
         self._router_originals: list[tuple[int, int, Tensor]] = []
         self._expert_deltas: list[tuple[int, int, float, Tensor, Tensor]] = []
 
+    @staticmethod
+    def _router_selected_indices(out: Any, module: Module) -> Tensor:
+        """Extract the per-token expert-index tensor from a router's output.
+
+        Router output conventions vary by architecture family:
+
+        - Ling/BailingMoeV3: ``(topk_idx, topk_weight, router_logits)`` —
+          indices FIRST, logits LAST.
+        - Other families put the index tensor elsewhere in the tuple, or
+          return bare logits.
+
+        Robust rule: expert indices are the first *integer* tensor element —
+        router weights and logits are always floating point.  When no integer
+        tensor is present, treat the first float tensor as logits and take
+        its top-k.
+        """
+        candidates = out if isinstance(out, tuple) else (out,)
+        for element in candidates:
+            if (
+                isinstance(element, Tensor)
+                and not element.is_floating_point()
+                and element.numel() > 0
+            ):
+                return element
+        logits = candidates[0] if isinstance(candidates[0], Tensor) else out
+        k = getattr(module, "top_k", 8)
+        _, selected = logits.topk(k, dim=-1)
+        return selected
+
     def identify_safety_experts(
         self,
         benign_msgs: list[Any],
@@ -1603,30 +1659,14 @@ class SteeringEngine:
         def _make_hook(layer_idx: int):
             def hook(module: Module, inp: Any, out: Any):
                 with torch.no_grad():
-                    if isinstance(out, tuple) and len(out) >= 3:
-                        # Router output order varies by MoE family:
-                        # Bailing v3 returns (topk_idx, topk_weight, logits)
-                        # — indices FIRST — while other families return
-                        # (weights, indices, ...) with indices last. Pick
-                        # the first integral tensor as the expert-id tensor.
-                        selected = None
-                        for cand in out:
-                            if isinstance(cand, torch.Tensor) and cand.dtype in (
-                                torch.int32,
-                                torch.int64,
-                            ):
-                                selected = cand
-                                break
-                        if selected is None:
-                            selected = (
-                                out[0] if isinstance(out[0], torch.Tensor) else out[1]
-                            )
-                    elif isinstance(out, tuple) and len(out) == 2:
-                        selected = out[1]
-                    else:
-                        logits = out if not isinstance(out, tuple) else out[0]
-                        k = getattr(module, "top_k", 8)
-                        _, selected = logits.topk(k, dim=-1)
+                    # Router output order varies by MoE family:
+                    # Bailing v3 returns (topk_idx, topk_weight, logits)
+                    # — indices FIRST — while other families return
+                    # (weights, indices, ...) with indices last. Canonical
+                    # rule, shared with safex via _router_selected_indices:
+                    # the first integral tensor is the expert-id tensor;
+                    # fall back to top-k over the first float tensor.
+                    selected = self._router_selected_indices(out, module)
 
                     flat = selected.reshape(-1)
                     k = getattr(module, "top_k", selected.shape[-1])

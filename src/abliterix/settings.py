@@ -112,6 +112,19 @@ class ModelConfig(BaseModel):
         description="Whether to trust remote code shipped with the model.",
     )
 
+    max_modulelist_experts: int | None = Field(
+        default=None,
+        description=(
+            "SC117: when a MoE layer stores its experts as an nn.ModuleList "
+            "larger than this, skip registering per-expert down_proj steering "
+            "targets (attention + shared-expert steering and router-weight "
+            "suppression remain active).  Ling/BailingMoeV3 uses 128 experts "
+            "per layer, so per-expert LoRA would mean ~3k adapters and ~9 GB "
+            "of bnb dequantisation per trial.  Default None = no limit "
+            "(upstream behaviour)."
+        ),
+    )
+
     attn_implementation: str | None = Field(
         default=None,
         description=(

@@ -153,27 +153,12 @@ def identify_safety_experts_safex(
         def hook(module: Module, inp: Any, out: Any):
             with torch.no_grad():
                 # Router output shapes vary by family — extract the
-                # top-k selection tensor. Bailing v3 returns
-                # (topk_idx, topk_weight, logits) with indices FIRST;
-                # pick the first integral tensor (same probe as
-                # engine.identify_safety_experts).
-                if isinstance(out, tuple) and len(out) >= 3:
-                    selected = None
-                    for cand in out:
-                        if isinstance(cand, torch.Tensor) and cand.dtype in (
-                            torch.int32,
-                            torch.int64,
-                        ):
-                            selected = cand
-                            break
-                    if selected is None:
-                        selected = out[0] if isinstance(out[0], torch.Tensor) else out[1]
-                elif isinstance(out, tuple) and len(out) == 2:
-                    selected = out[1]
-                else:
-                    logits = out if not isinstance(out, tuple) else out[0]
-                    k = getattr(module, "top_k", 8)
-                    _, selected = logits.topk(k, dim=-1)
+                # top-k selection tensor via the engine's canonical probe
+                # (see engine._router_selected_indices): Bailing v3
+                # returns (topk_idx, topk_weight, logits) with indices
+                # FIRST — first integral tensor wins; otherwise top-k
+                # over the first float tensor.
+                selected = engine._router_selected_indices(out, module)
 
                 _record_prompt_rates(active[0], layer_idx, selected, n_experts)
 
