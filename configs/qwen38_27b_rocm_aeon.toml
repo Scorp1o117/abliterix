@@ -1,0 +1,103 @@
+# Qwen3.8-27B AEON-style Abliterix: 3-token KL, o_proj[1,6], down[2,10].
+# Ranges from AEON-7 Qwen3.6 published toml. One seed ≈ their t46 winner.
+# BF16, batch 128, keyword judge, 50/15. Do not reuse high-o / down≈0 seeds.
+
+[model]
+model_id = "/run/media/s117/OS/Models/Qwen3.8-27B"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "110GB", "cpu" = "8GB"}
+trust_remote_code = true
+custom_encoder_module = "scripts/qwen38_encode.py"
+custom_encoder_kwargs = {enable_thinking = false}
+
+[inference]
+batch_size = 128
+min_batch_size = 1
+max_batch_size = 128
+skip_common_response_prefix = true
+min_gen_tokens = 32
+max_gen_tokens = 160
+
+[steering]
+steering_mode = "lora"
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "none"
+strength_range = [1.0, 5.0]
+disabled_components = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [1.0, 6.0]
+"mlp.down_proj" = [2.0, 10.0]
+
+[optimization]
+num_trials = 50
+num_warmup_trials = 15
+checkpoint_dir = "checkpoints_qwen38_27b_aeon"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 16
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+# AEON Qwen3.6 trial 46 (published). Positions not listed; peak near mid/late stack.
+[[optimization.seed_trials]]
+vector_scope = "per layer"
+vector_index = 46.08
+"attn.o_proj.max_weight" = 1.56
+"attn.o_proj.max_weight_position" = 50.0
+"attn.o_proj.min_weight" = 0.378
+"attn.o_proj.min_weight_distance" = 16.03
+"mlp.down_proj.max_weight" = 3.45
+"mlp.down_proj.max_weight_position" = 46.0
+"mlp.down_proj.min_weight" = 0.001
+"mlp.down_proj.min_weight_distance" = 24.94
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.005
+prune_threshold = 0.5
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = true
+overwrite_checkpoint = true
+system_prompt = "You are a helpful assistant."
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

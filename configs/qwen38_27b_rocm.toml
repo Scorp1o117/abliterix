@@ -1,0 +1,98 @@
+# Qwen3.8-27B first search on Linux ROCm gfx1151.
+#
+# Architecture is the Qwen3.6-27B family (Qwen3_5ForConditionalGeneration):
+# 64 decoder layers = 48 GDN linear_attn.out_proj + 16 full-attn o_proj,
+# both registered as attn.o_proj. Q/K/V only exist on the 16 full-attn
+# layers — leave them disabled. Recipe from configs/qwen3.6_27b.toml
+# (projected + winsorize, LoRA).
+#
+# Hardware: 128G UMA. BF16 load suicided uma_guard at ~60% (double-copy).
+# First pass is bnb NF4 + LoRA + auto-batch. Target ≤10/100 @ KL 0.05.
+
+[model]
+model_id = "/run/media/s117/OS/Models/Qwen3.8-27B"
+dtype_fallback_order = ["float16"]
+quant_method = "bnb_4bit"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "80GB", "cpu" = "20GB"}
+custom_encoder_module = "scripts/qwen38_encode.py"
+custom_encoder_kwargs = {enable_thinking = false}
+
+[inference]
+# Post-FLA bench (fixed 32 tok): 1=4.2, 8=6.8, 16=13, 32=23,
+# 64=39, 128=59, 256=77 tok/s. Lock the measured winner.
+batch_size = 256
+min_batch_size = 1
+max_batch_size = 256
+skip_common_response_prefix = false
+min_gen_tokens = 32
+max_gen_tokens = 160
+
+[steering]
+steering_mode = "lora"
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "none"
+strength_range = [1.0, 5.0]
+disabled_components = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [1.0, 6.0]
+"mlp.down_proj" = [1.0, 5.0]
+
+[optimization]
+num_trials = 30
+num_warmup_trials = 10
+checkpoint_dir = "checkpoints_qwen38_27b"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 16
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.005
+prune_threshold = 0.5
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = true
+overwrite_checkpoint = true
+system_prompt = "You are a helpful assistant."
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

@@ -1,0 +1,93 @@
+# Spark-X2.5-4B — PCA residual LoRA (V9 envelope)
+#
+# Unlikelihood from original: 8 steps → 98/100 @ KL 0.273. First-token
+# CE cannot open Spark inside KL 0.05. PCA may isolate a cleaner
+# first-PC refusal direction than mean-diff.
+
+non_interactive = true
+overwrite_checkpoint = true
+system_prompt = "You are a helpful assistant."
+
+[model]
+model_id = "/run/media/s117/OS/Models/Spark-X2.5-4B"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+trust_remote_code = true
+
+[inference]
+batch_size = 64
+min_batch_size = 1
+max_batch_size = 64
+max_gen_tokens = 150
+skip_common_response_prefix = true
+
+[steering]
+vector_method = "pca"
+steering_mode = "lora"
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+discriminative_layer_selection = true
+decay_kernel = "gaussian"
+weight_normalization = "full"
+full_norm_lora_rank = 3
+orthogonal_projection = true
+strength_range = [0.8, 7.0]
+auto_disable_components = ["mlp.down_proj"]
+auto_disable_floor = -0.3
+disabled_components = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [2.5, 6.5]
+"attn.qkv_proj" = [0.4, 3.0]
+"mlp.down_proj" = [0.0, 0.8]
+
+[optimization]
+num_trials = 30
+num_warmup_trials = 10
+checkpoint_dir = "checkpoints_spark_x25_4b_lora_v19"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 100
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.03
+prune_threshold = 0.12
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

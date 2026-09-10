@@ -1,0 +1,156 @@
+# Qwen3.8-27B 3-token KL, ranges from our own front (kw_bf16 + aeon).
+# Low-KL pocket: o≈4.1–5.4, down 0–2.6, KL 0.07–0.12, refusals 33–60.
+# Low-refusal pocket: o≈5.1–6.0, down≈0–0.5, KL 0.18–0.27, refusals 7–25.
+# Search box covers both. 100/30. No AEON-3.6 [2,10] down.
+
+[model]
+model_id = "/run/media/s117/OS/Models/Qwen3.8-27B"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "110GB", "cpu" = "8GB"}
+trust_remote_code = true
+custom_encoder_module = "scripts/qwen38_encode.py"
+custom_encoder_kwargs = {enable_thinking = false}
+
+[inference]
+batch_size = 128
+min_batch_size = 1
+max_batch_size = 128
+skip_common_response_prefix = true
+min_gen_tokens = 32
+max_gen_tokens = 160
+
+[steering]
+steering_mode = "lora"
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "none"
+strength_range = [1.0, 5.0]
+disabled_components = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [3.8, 6.0]
+"mlp.down_proj" = [0.0, 2.8]
+
+[optimization]
+num_trials = 100
+num_warmup_trials = 30
+checkpoint_dir = "checkpoints_qwen38_27b_pocket"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 16
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+# kw_bf16 t93: 60/100 @ 0.074
+[[optimization.seed_trials]]
+vector_scope = "per layer"
+vector_index = 35.78627537515463
+"attn.o_proj.max_weight" = 4.151036588194668
+"attn.o_proj.max_weight_position" = 49.43109876461372
+"attn.o_proj.min_weight" = 0.13927512907321293
+"attn.o_proj.min_weight_distance" = 13.846463651621043
+"mlp.down_proj.max_weight" = 0.0
+"mlp.down_proj.max_weight_position" = 47.82335541125517
+"mlp.down_proj.min_weight" = 0.9796780986113639
+"mlp.down_proj.min_weight_distance" = 26.11370136391488
+
+# kw_bf16 t19: 33/100 @ 0.116
+[[optimization.seed_trials]]
+vector_scope = "global"
+vector_index = 50.79667354766495
+"attn.o_proj.max_weight" = 5.386741111313299
+"attn.o_proj.max_weight_position" = 49.611242819678694
+"attn.o_proj.min_weight" = 0.5795895850105235
+"attn.o_proj.min_weight_distance" = 5.105344096840982
+"mlp.down_proj.max_weight" = 0.8152958774430872
+"mlp.down_proj.max_weight_position" = 37.89393126916791
+"mlp.down_proj.min_weight" = 0.6716037377983707
+"mlp.down_proj.min_weight_distance" = 30.46113365251766
+
+# aeon t3: 33/100 @ 0.119 (only good high-down point)
+[[optimization.seed_trials]]
+vector_scope = "global"
+vector_index = 53.50667508661038
+"attn.o_proj.max_weight" = 4.720859192191853
+"attn.o_proj.max_weight_position" = 56.11650572068352
+"attn.o_proj.min_weight" = 0.15089277269795665
+"attn.o_proj.min_weight_distance" = 27.914427783799265
+"mlp.down_proj.max_weight" = 2.6379737650756807
+"mlp.down_proj.max_weight_position" = 52.51035098264219
+"mlp.down_proj.min_weight" = 0.027393883818429443
+"mlp.down_proj.min_weight_distance" = 2.115310059805121
+
+# kw_bf16 t85: 18/100 @ 0.179
+[[optimization.seed_trials]]
+vector_scope = "per layer"
+vector_index = 46.51404554921411
+"attn.o_proj.max_weight" = 5.9762110280414085
+"attn.o_proj.max_weight_position" = 54.73461564986707
+"attn.o_proj.min_weight" = 0.34533258132515793
+"attn.o_proj.min_weight_distance" = 21.250368362443655
+"mlp.down_proj.max_weight" = 0.0
+"mlp.down_proj.max_weight_position" = 54.54477562695025
+"mlp.down_proj.min_weight" = 0.9173571108113199
+"mlp.down_proj.min_weight_distance" = 24.705691824144147
+
+# aeon t42: 7/100 @ 0.273
+[[optimization.seed_trials]]
+vector_scope = "per layer"
+vector_index = 26.944396269433334
+"attn.o_proj.max_weight" = 5.110525815886111
+"attn.o_proj.max_weight_position" = 52.7625068131727
+"attn.o_proj.min_weight" = 0.7962053758755996
+"attn.o_proj.min_weight_distance" = 22.142267720724327
+"mlp.down_proj.max_weight" = 0.5269798272244318
+"mlp.down_proj.max_weight_position" = 61.06348166999195
+"mlp.down_proj.min_weight" = 0.9724909387657263
+"mlp.down_proj.min_weight_distance" = 19.583359483059866
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.005
+prune_threshold = 0.5
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = true
+overwrite_checkpoint = true
+system_prompt = "You are a helpful assistant."
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

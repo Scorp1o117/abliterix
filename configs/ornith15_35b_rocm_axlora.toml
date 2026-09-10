@@ -1,0 +1,127 @@
+# Ornith-1.5-35B-A3B — native Abliterix LoRA TPE (not 1.0 MPOA).
+#
+# MPOA full-norm rank-3 (wide study) bottomed at t39 30/100 @ 0.078.
+# This study is default Abliterix rank-1 LoRA + projected abliteration,
+# o_proj + down_proj only, same 40-layer MoE BF16 load path.
+
+system_prompt = "You are a helpful assistant."
+
+[model]
+model_id = "/run/media/s117/OS/Models/Ornith-1.5-35B-A3B"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+trust_remote_code = true
+
+[inference]
+batch_size = 128
+min_batch_size = 1
+max_batch_size = 128
+skip_common_response_prefix = true
+min_gen_tokens = 32
+max_gen_tokens = 160
+
+[steering]
+steering_mode = "lora"
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "none"
+discriminative_layer_selection = false
+search_harmfulness_direction = false
+strength_range = [0.8, 10.0]
+disabled_components = [
+  "attn.q_proj",
+  "attn.k_proj",
+  "attn.v_proj",
+]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [1.0, 8.0]
+"mlp.down_proj" = [0.0, 10.0]
+
+[experts]
+max_suppress = 0
+router_bias_range = [0.0, 0.0]
+ablation_weight_range = [0.0, 0.0]
+
+[optimization]
+num_trials = 60
+num_warmup_trials = 20
+sampler_seed = 117
+checkpoint_dir = "checkpoints_ornith15_35b_axlora"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 20
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+# Wide MPOA t39: 30/100 @ 0.078 (envelope reused as a LoRA seed).
+[[optimization.seed_trials]]
+vector_scope = "per layer"
+vector_index = 36.22
+"attn.o_proj.max_weight" = 3.23
+"attn.o_proj.max_weight_position" = 36.22
+"attn.o_proj.min_weight" = 1.49
+"attn.o_proj.min_weight_distance" = 13.94
+"mlp.down_proj.max_weight" = 9.19
+"mlp.down_proj.max_weight_position" = 37.15
+"mlp.down_proj.min_weight" = 3.23
+"mlp.down_proj.min_weight_distance" = 12.53
+
+# Wide t10: 46/100 @ 0.086, high o_proj.
+[[optimization.seed_trials]]
+vector_scope = "per layer"
+vector_index = 34.46
+"attn.o_proj.max_weight" = 7.44
+"attn.o_proj.max_weight_position" = 34.46
+"attn.o_proj.min_weight" = 0.32
+"attn.o_proj.min_weight_distance" = 11.21
+"mlp.down_proj.max_weight" = 6.42
+"mlp.down_proj.max_weight_position" = 37.62
+"mlp.down_proj.min_weight" = 0.14
+"mlp.down_proj.min_weight_distance" = 22.93
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01
+prune_threshold = 0.6
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = true
+
+[benign_prompts]
+dataset = "datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "datasets/good_1000"
+split = "train[800:900]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "datasets/harmful_1000"
+split = "train[800:900]"
+column = "prompt"

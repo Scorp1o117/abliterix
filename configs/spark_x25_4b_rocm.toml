@@ -1,0 +1,101 @@
+# Spark-X2.5-4B (XHToken) on Linux ROCm gfx1151 — full search config.
+#
+# Architecture (custom trust_remote_code, model_type=spark2_5):
+#   36 layers, hidden=2560, intermediate=10240, GQA 16/4, head_dim=256
+#   Hybrid attention: 3 sliding_window(512) + 1 full, repeating
+#   Fused QKV: self_attn.q_k_v_proj  (not q/k/v_proj)
+#   Attn out:  self_attn.out_proj    (engine maps this to attn.o_proj)
+#   Headwise attn output gate: self_attn.g_proj (sigmoid)
+#   MLP: gate/up/down_proj, gelu, no bias
+#   Native 1M context, thinking default-on (chat_template enable_thinking)
+#
+# Engine: out_proj already registered as attn.o_proj (LFM2 path).
+# modeling_spark.py does not collect hidden_states; run
+#   python scripts/patch_spark_x25_hidden_states.py
+# once after download.
+
+[model]
+model_id = "/run/media/s117/OS/Models/Spark-X2.5-4B"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+trust_remote_code = true
+
+[inference]
+# HS saturates at bs=16–32 (~51 prompt/s). Generate still climbs to 128/256
+# but residual capture is the memory cliff — stay at 64 on 122G UMA.
+batch_size = 64
+min_batch_size = 1
+max_batch_size = 64
+max_gen_tokens = 150
+skip_common_response_prefix = true
+
+[steering]
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "none"
+strength_range = [1.0, 10.0]
+# No separate q/k/v modules. Fused q_k_v_proj is registered as attn.qkv_proj
+# and left off the first search (classic o_proj + down_proj recipe).
+disabled_components = ["attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.qkv_proj"]
+
+[steering.component_strength_ranges]
+"mlp.down_proj" = [2.0, 10.0]
+"attn.o_proj" = [1.0, 6.0]
+
+[optimization]
+num_trials = 60
+num_warmup_trials = 20
+checkpoint_dir = "checkpoints_spark_x25_4b"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 100
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.005
+prune_threshold = 0.5
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = false
+overwrite_checkpoint = true
+system_prompt = "You are a helpful assistant."
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

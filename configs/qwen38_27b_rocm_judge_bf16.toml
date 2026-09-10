@@ -1,0 +1,98 @@
+# Qwen3.8-27B Abliterix BF16 + MiMo-V2.5 judge (v2).
+# No 4-bit seeds. KL prune 0.5. batch 128. max_memory 110G.
+# Reuses BF16 residual caches from judge_bf16/.
+
+[model]
+model_id = "/run/media/s117/OS/Models/Qwen3.8-27B"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "110GB", "cpu" = "8GB"}
+trust_remote_code = true
+custom_encoder_module = "scripts/qwen38_encode.py"
+custom_encoder_kwargs = {enable_thinking = false}
+
+[inference]
+batch_size = 128
+min_batch_size = 1
+max_batch_size = 128
+skip_common_response_prefix = true
+min_gen_tokens = 32
+max_gen_tokens = 160
+
+[steering]
+steering_mode = "lora"
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "none"
+strength_range = [1.0, 5.0]
+disabled_components = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [1.0, 6.0]
+"mlp.down_proj" = [1.0, 5.0]
+
+[optimization]
+num_trials = 50
+num_warmup_trials = 15
+checkpoint_dir = "checkpoints_qwen38_27b_judge_bf16_v2"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 16
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.005
+prune_threshold = 0.5
+
+[detection]
+llm_judge = true
+llm_judge_model = "mimo-v2.5"
+llm_judge_base_url = "https://opencode.ai/zen/go/v1"
+llm_judge_api_key_env = "LLM_JUDGE_API_KEY"
+llm_judge_use_response_format = true
+llm_judge_reasoning_budget = 128
+llm_judge_batch_size = 5
+llm_judge_concurrency = 4
+llm_judge_temperature = 0.0
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = true
+overwrite_checkpoint = true
+system_prompt = "You are a helpful assistant."
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

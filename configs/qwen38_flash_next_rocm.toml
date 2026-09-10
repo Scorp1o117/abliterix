@@ -1,0 +1,98 @@
+# Qwen3.8-Flash-Next (qwen4_exp) — mergeable LoRA search on Linux ROCm UMA.
+#
+# HIT (selection, not a single-trial gate): refusal ~10/100 AND KL ~0.05
+#   (lower KL better). Search is steering_mode=lora only so export_adapter
+#   can ship a mergeable adapter. export_merged is refused on this host
+#   (would reload the ~336G BF16 checkpoint).
+#
+# Load is OOM-gated: n-gram/PLE shards are never bulk-cloned to CUDA;
+# fused 3-D experts are not bitsandbytes Linear so naive bnb4bit still
+# does not fit 128G. The engine preflights and refuses unless
+# ABLITERIX_QWEN4EXP_ALLOW_LOAD=1 on a machine that can hold the weights.
+#
+# First-pass batch is small (activation peak, not average occupancy).
+
+[model]
+model_id = "/run/media/s117/KIOXIA 1TB/Models/Qwen3.8-Flash-Next"
+dtype_fallback_order = ["bfloat16", "float16"]
+quant_method = "bnb_4bit"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "64GB", "cpu" = "24GB"}
+trust_remote_code = true
+
+[inference]
+batch_size = 1
+min_batch_size = 1
+max_batch_size = 4
+skip_common_response_prefix = false
+min_gen_tokens = 32
+max_gen_tokens = 160
+
+[steering]
+steering_mode = "lora"
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "none"
+strength_range = [1.0, 4.0]
+disabled_components = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [1.0, 4.0]
+"mlp.down_proj" = [0.5, 3.0]
+
+[optimization]
+num_trials = 20
+num_warmup_trials = 8
+checkpoint_dir = "checkpoints_qwen38_flash_next"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 16
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.05
+prune_threshold = 0.5
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = true
+overwrite_checkpoint = false
+system_prompt = "You are a helpful assistant."
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

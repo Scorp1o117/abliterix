@@ -1,0 +1,105 @@
+# Muse Glimmer-30B v2 — same residuals as smoke, DIRECT weight edit.
+#
+# Smoke (LoRA, default) finished 8/8 trials at 28-30/30 prescreen prune.
+# Baseline 97/100 refusals. Steering vectors are real (mean-sep peaks in
+# layers 40-46, relative 0.45) but the decoder is Gemma-style 4×RMSNorm
+# (input / post-attn / pre-FF / post-FF). LoRA is eaten, same as Gemma 4.
+# v2 keeps the cached baseline+vectors and only changes application mode.
+#
+# Reuse: copy smoke *_baseline.pt and *_steering.pt into
+# checkpoints_muse_glimmer_30b_v2 before launch.
+
+[model]
+model_id = "/run/media/s117/OS/Models/Muse-Glimmer-30B"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "104GB", "cpu" = "16GB"}
+custom_encoder_module = "scripts/muse_glimmer_encode.py"
+custom_encoder_kwargs = {reasoning_strength = "low"}
+
+[inference]
+batch_size = 8
+min_batch_size = 1
+max_batch_size = 16
+skip_common_response_prefix = true
+min_gen_tokens = 64
+max_gen_tokens = 200
+
+[steering]
+steering_mode = "direct"
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "full"
+full_norm_lora_rank = 3
+strength_range = [0.8, 1.5]
+disabled_components = [
+  "attn.q_proj",
+  "attn.k_proj",
+  "attn.v_proj",
+  "mlp.gate_proj",
+  "mlp.up_proj",
+]
+auto_disable_components = ["mlp.down_proj"]
+auto_disable_floor = -0.25
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [0.8, 1.5]
+"mlp.down_proj" = [0.0, 1.5]
+
+[optimization]
+num_trials = 12
+num_warmup_trials = 6
+checkpoint_dir = "checkpoints_muse_glimmer_30b_v2"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 30
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.005
+prune_threshold = 0.5
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = true
+overwrite_checkpoint = true
+system_prompt = "You are a helpful assistant."
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

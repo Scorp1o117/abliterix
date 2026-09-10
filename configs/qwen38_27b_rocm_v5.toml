@@ -1,0 +1,103 @@
+# Qwen3.8-27B v5 — angular decoder-block, original weights, KL-capped.
+#
+# LoRA v1/v3/v4 never entered 10/100 @ KL 0.05 vs original. QKV made
+# KL worse. Angular rotates the full block output (including skip),
+# which is not a rank-1 o_proj edit. Search 0.35–1.0 (up to 90°) on
+# the same residual cache. Runtime-only; if it hits the box we know
+# the direction exists and can hunt a weight recipe later.
+
+[model]
+model_id = "/run/media/s117/OS/Models/Qwen3.8-27B"
+dtype_fallback_order = ["float16"]
+quant_method = "bnb_4bit"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "80GB", "cpu" = "20GB"}
+custom_encoder_module = "scripts/qwen38_encode.py"
+custom_encoder_kwargs = {enable_thinking = false}
+
+[inference]
+batch_size = 256
+min_batch_size = 1
+max_batch_size = 256
+skip_common_response_prefix = false
+min_gen_tokens = 32
+max_gen_tokens = 160
+
+[steering]
+steering_mode = "angular"
+angular_overrotation = false
+fixed_vector_scope = "per layer"
+runtime_hook_site = "decoder_block"
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "none"
+strength_range = [0.35, 1.0]
+disabled_components = [
+  "attn.q_proj",
+  "attn.k_proj",
+  "attn.v_proj",
+  "mlp.gate_proj",
+  "mlp.up_proj",
+  "mlp.down_proj",
+]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [0.35, 1.0]
+
+[optimization]
+num_trials = 30
+num_warmup_trials = 10
+sampler_seed = 518
+checkpoint_dir = "checkpoints_qwen38_27b_v5"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 16
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.03
+prune_threshold = 0.08
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = true
+overwrite_checkpoint = true
+system_prompt = "You are a helpful assistant."
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

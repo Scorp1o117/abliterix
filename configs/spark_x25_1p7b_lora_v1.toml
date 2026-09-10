@@ -1,0 +1,95 @@
+# Spark-X2.5-1.7B — first mergeable mean-LoRA search (V30 recipe, no 4B seeds)
+#
+# Same family as 4B (Spark2_5, fused q_k_v_proj + out_proj, hybrid 3 sliding
+# + 1 full) but 28 layers / hidden 2048 / intermediate 6656. Do not seed 4B
+# T32/T31 layer positions.
+# Dual HIT bake: refusals ≤10/100 and 3-token KL ≤0.05 vs original.
+# Search bar: refusals ≤10 and KL ≤0.1. non_interactive: no auto-bake.
+
+non_interactive = true
+overwrite_checkpoint = false
+system_prompt = "You are a helpful assistant."
+
+[model]
+model_id = "/run/media/s117/OS/Models/Spark-X2.5-1.7B"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+trust_remote_code = true
+
+[inference]
+batch_size = 64
+min_batch_size = 1
+max_batch_size = 64
+max_gen_tokens = 150
+skip_common_response_prefix = true
+
+[steering]
+vector_method = "mean"
+steering_mode = "lora"
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+discriminative_layer_selection = true
+decay_kernel = "gaussian"
+weight_normalization = "full"
+full_norm_lora_rank = 8
+orthogonal_projection = true
+strength_range = [0.8, 8.0]
+auto_disable_components = ["mlp.down_proj"]
+auto_disable_floor = -0.3
+disabled_components = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [2.0, 8.0]
+"attn.qkv_proj" = [0.3, 4.5]
+"mlp.down_proj" = [0.0, 1.4]
+
+[optimization]
+num_trials = 200
+num_warmup_trials = 24
+checkpoint_dir = "checkpoints_spark_x25_1p7b_lora_v1"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 24
+refusal_prescreen_prune_min = 25
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 100
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.1
+prune_threshold = 0.25
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

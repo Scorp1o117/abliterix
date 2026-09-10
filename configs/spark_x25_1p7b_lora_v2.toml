@@ -1,0 +1,214 @@
+# Spark-X2.5-1.7B — V2 mean LoRA seeded from 4B V30 champions
+#
+# Do not continue unseeded V1. Layer/index/distance scaled 4B→1.7B by 27/35
+# (last_layer 35→27). Strengths and min_weight fractions copied as-is, then
+# clamped into the 1.7B Optuna box so enqueue_trial cannot reject.
+# Dual HIT bake: refusals ≤10/100 and 3-token KL ≤0.05 vs original.
+# Search bar: refusals ≤10 and KL ≤0.1. non_interactive: no auto-bake.
+
+non_interactive = true
+overwrite_checkpoint = false
+system_prompt = "You are a helpful assistant."
+
+[model]
+model_id = "/run/media/s117/OS/Models/Spark-X2.5-1.7B"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+trust_remote_code = true
+
+[inference]
+batch_size = 64
+min_batch_size = 1
+max_batch_size = 64
+max_gen_tokens = 150
+skip_common_response_prefix = true
+
+[steering]
+vector_method = "mean"
+steering_mode = "lora"
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+discriminative_layer_selection = true
+decay_kernel = "gaussian"
+weight_normalization = "full"
+full_norm_lora_rank = 8
+orthogonal_projection = true
+strength_range = [0.8, 8.0]
+auto_disable_components = ["mlp.down_proj"]
+auto_disable_floor = -0.3
+disabled_components = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [2.0, 8.0]
+"attn.qkv_proj" = [0.3, 4.5]
+"mlp.down_proj" = [0.0, 1.4]
+
+[optimization]
+num_trials = 200
+num_warmup_trials = 7
+checkpoint_dir = "checkpoints_spark_x25_1p7b_lora_v2"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 24
+refusal_prescreen_prune_min = 25
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 100
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+# 4B V30 T580 global 20@0.0929 (KL-efficient champion)
+[[optimization.seed_trials]]
+vector_scope = 'global'
+vector_index = 14.378089643035986
+"attn.o_proj.max_weight" = 7.75191428106516
+"attn.o_proj.max_weight_position" = 18.10976841527172
+"attn.o_proj.min_weight" = 0.936556393139836
+"attn.o_proj.min_weight_distance" = 6.348506135118456
+"attn.qkv_proj.max_weight" = 3.575930074187675
+"attn.qkv_proj.max_weight_position" = 26.166555404541427
+"attn.qkv_proj.min_weight" = 0.1923155591008342
+"attn.qkv_proj.min_weight_distance" = 13.38798105239135
+"mlp.down_proj.max_weight" = 0.5474917367744505
+"mlp.down_proj.max_weight_position" = 23.225811716182942
+"mlp.down_proj.min_weight" = 0.7573006205466188
+"mlp.down_proj.min_weight_distance" = 14.419024613308428
+
+# 4B V30 T579 global 22@0.0893
+[[optimization.seed_trials]]
+vector_scope = 'global'
+vector_index = 14.792861266236095
+"attn.o_proj.max_weight" = 7.621190859767549
+"attn.o_proj.max_weight_position" = 16.684533628010957
+"attn.o_proj.min_weight" = 0.9709068808636473
+"attn.o_proj.min_weight_distance" = 8.592542679335445
+"attn.qkv_proj.max_weight" = 3.126048632933964
+"attn.qkv_proj.max_weight_position" = 23.23677522606223
+"attn.qkv_proj.min_weight" = 0.017206910457176303
+"attn.qkv_proj.min_weight_distance" = 8.79095462342074
+"mlp.down_proj.max_weight" = 0.4739771630799934
+"mlp.down_proj.max_weight_position" = 21.134642826174463
+"mlp.down_proj.min_weight" = 0.7689878734632031
+"mlp.down_proj.min_weight_distance" = 15.705383913676672
+
+# 4B V30 T186 per-layer 18@0.1095
+[[optimization.seed_trials]]
+vector_scope = 'per layer'
+vector_index = 18.563466216134344
+"attn.o_proj.max_weight" = 7.4442795215819455
+"attn.o_proj.max_weight_position" = 16.479172259337354
+"attn.o_proj.min_weight" = 0.8020032706440894
+"attn.o_proj.min_weight_distance" = 7.177619431525459
+"attn.qkv_proj.max_weight" = 0.7634135453068376
+"attn.qkv_proj.max_weight_position" = 18.89824723651988
+"attn.qkv_proj.min_weight" = 0.5200981718761326
+"attn.qkv_proj.min_weight_distance" = 1.5070813809873025
+"mlp.down_proj.max_weight" = 1.2393895381974016
+"mlp.down_proj.max_weight_position" = 20.732641649065904
+"mlp.down_proj.min_weight" = 0.3880598100774589
+"mlp.down_proj.min_weight_distance" = 9.618548579546731
+
+# 4B V30 T389 per-layer 10@0.1433
+[[optimization.seed_trials]]
+vector_scope = 'per layer'
+vector_index = 24.09384695271063
+"attn.o_proj.max_weight" = 6.660110753411171
+"attn.o_proj.max_weight_position" = 16.322969727882302
+"attn.o_proj.min_weight" = 0.7659104285344549
+"attn.o_proj.min_weight_distance" = 7.677315187557055
+"attn.qkv_proj.max_weight" = 4.076127117829479
+"attn.qkv_proj.max_weight_position" = 25.143606253398865
+"attn.qkv_proj.min_weight" = 0.16687828144946923
+"attn.qkv_proj.min_weight_distance" = 1.8426347282692315
+"mlp.down_proj.max_weight" = 1.3626947115322974
+"mlp.down_proj.max_weight_position" = 21.718847438966268
+"mlp.down_proj.min_weight" = 0.9842506888231703
+"mlp.down_proj.min_weight_distance" = 11.796283234127028
+
+# 4B V30 T615 per-layer 7@0.1468
+[[optimization.seed_trials]]
+vector_scope = 'per layer'
+vector_index = 24.20402116053674
+"attn.o_proj.max_weight" = 7.498078351394096
+"attn.o_proj.max_weight_position" = 16.677003243912132
+"attn.o_proj.min_weight" = 0.9492063943177865
+"attn.o_proj.min_weight_distance" = 8.025295329401711
+"attn.qkv_proj.max_weight" = 2.734849026831524
+"attn.qkv_proj.max_weight_position" = 26.56739259447431
+"attn.qkv_proj.min_weight" = 0.3740708066260801
+"attn.qkv_proj.min_weight_distance" = 5.539716476043366
+"mlp.down_proj.max_weight" = 1.3300315021224867
+"mlp.down_proj.max_weight_position" = 16.723061844992163
+"mlp.down_proj.min_weight" = 0.7809351155520097
+"mlp.down_proj.min_weight_distance" = 6.461969163196198
+
+# 4B V30 T532 per-layer 50@0.0445 (KL-cheap)
+[[optimization.seed_trials]]
+vector_scope = 'per layer'
+vector_index = 20.987504978165628
+"attn.o_proj.max_weight" = 7.670522169928059
+"attn.o_proj.max_weight_position" = 18.51046359331626
+"attn.o_proj.min_weight" = 0.825611759260348
+"attn.o_proj.min_weight_distance" = 5.529655626590048
+"attn.qkv_proj.max_weight" = 1.4618189140914488
+"attn.qkv_proj.max_weight_position" = 22.93764996093852
+"attn.qkv_proj.min_weight" = 0.7494055090323964
+"attn.qkv_proj.min_weight_distance" = 2.8302103158946283
+"mlp.down_proj.max_weight" = 0.1636833155011846
+"mlp.down_proj.max_weight_position" = 19.834308855947732
+"mlp.down_proj.min_weight" = 0.8481823622538378
+"mlp.down_proj.min_weight_distance" = 4.0852290071739645
+
+# 4B V30 T221 per-layer 3@0.2299 (most open)
+[[optimization.seed_trials]]
+vector_scope = 'per layer'
+vector_index = 23.826872302561945
+"attn.o_proj.max_weight" = 7.183507501691352
+"attn.o_proj.max_weight_position" = 17.306956433214555
+"attn.o_proj.min_weight" = 0.5527724248885315
+"attn.o_proj.min_weight_distance" = 8.990502292263855
+"attn.qkv_proj.max_weight" = 4.204968103122894
+"attn.qkv_proj.max_weight_position" = 26.135644368991503
+"attn.qkv_proj.min_weight" = 0.03649295471857161
+"attn.qkv_proj.min_weight_distance" = 5.31052201680535
+"mlp.down_proj.max_weight" = 1.1651043545278692
+"mlp.down_proj.max_weight_position" = 22.270099574073715
+"mlp.down_proj.min_weight" = 0.7997716967652393
+"mlp.down_proj.min_weight_distance" = 12.438667443280012
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.1
+prune_threshold = 0.25
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

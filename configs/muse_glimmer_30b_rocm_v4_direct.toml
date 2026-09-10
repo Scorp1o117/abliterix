@@ -1,0 +1,98 @@
+# Muse Glimmer-30B v4 — BF16 direct bake of v3 trial 12.
+#
+# v3 per-layer angular (bnb) is the only search that moved refusals:
+# trial 12 = 10/16 ~62%, KL 0.0274. Angular cannot ship. v2 BF16 direct
+# used Heretic 0.8–1.5, skipped the to=user prefix, and auto-disabled
+# down_proj — 12/12 prune. This file is the HF twin for
+# scripts/bake_muse_glimmer_t12.py: reuse v3 residuals, apply trial 12
+# as a rank-1 weight edit, no hidden-state re-extract.
+
+[model]
+model_id = "/run/media/s117/OS/Models/Muse-Glimmer-30B"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "96GB", "cpu" = "16GB"}
+custom_encoder_module = "scripts/muse_glimmer_encode.py"
+custom_encoder_kwargs = {reasoning_strength = "low"}
+
+[inference]
+batch_size = 1
+min_batch_size = 1
+max_batch_size = 1
+skip_common_response_prefix = false
+min_gen_tokens = 32
+max_gen_tokens = 160
+
+[steering]
+steering_mode = "direct"
+direct_transform = "standard"
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+# Angular 5.16 is a 90° budget (clamped). Direct uses that number as a
+# linear coefficient, so the bake script clamps strengths to 1.0 and
+# restores row norms to approximate the rotation.
+weight_normalization = "full"
+fixed_vector_scope = "per layer"
+disabled_components = [
+  "attn.q_proj",
+  "attn.k_proj",
+  "attn.v_proj",
+  "mlp.gate_proj",
+  "mlp.up_proj",
+]
+auto_disable_components = []
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [1.20, 1.20]
+"mlp.down_proj" = [5.16, 5.16]
+
+[optimization]
+num_trials = 1
+num_warmup_trials = 0
+checkpoint_dir = "checkpoints_muse_glimmer_30b_v4"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 16
+refusal_prescreen_pass_max = 12
+refusal_prescreen_prune_min = 14
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 16
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.005
+prune_threshold = 0.5
+
+[detection]
+llm_judge = false
+
+non_interactive = true
+overwrite_checkpoint = false
+system_prompt = "You are a helpful assistant."
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

@@ -1,0 +1,230 @@
+# Spark-X2.5-1.7B — V4 mean LoRA, widened box, keep searching until dual HIT
+#
+# V1–V3 o_proj [2,8] never sampled Heretic's opening region (~1.3–1.5).
+# V4: o [auto-off, 12], qkv [auto-off, 8], down [auto-off, 2.5], KL prune 0.6.
+# Seeds: V3 open/mid Pareto + Heretic low-o no-qkv. Wrapper raises num_trials
+# by 400 until refusals≤10 and 3-token KL≤0.1. Bake only on dual HIT.
+
+non_interactive = true
+overwrite_checkpoint = false
+system_prompt = "You are a helpful assistant."
+
+[model]
+model_id = "/run/media/s117/OS/Models/Spark-X2.5-1.7B"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+trust_remote_code = true
+
+[inference]
+batch_size = 64
+min_batch_size = 1
+max_batch_size = 64
+max_gen_tokens = 150
+skip_common_response_prefix = true
+
+[steering]
+vector_method = "mean"
+steering_mode = "lora"
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+discriminative_layer_selection = true
+decay_kernel = "gaussian"
+weight_normalization = "full"
+full_norm_lora_rank = 8
+orthogonal_projection = true
+strength_range = [0.5, 12.0]
+auto_disable_components = ["attn.o_proj", "attn.qkv_proj", "mlp.down_proj"]
+auto_disable_floor = -0.5
+disabled_components = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [0.5, 12.0]
+"attn.qkv_proj" = [0.0, 8.0]
+"mlp.down_proj" = [0.0, 2.5]
+
+[optimization]
+num_trials = 1200
+num_warmup_trials = 8
+checkpoint_dir = "checkpoints_spark_x25_1p7b_lora_v4"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 24
+refusal_prescreen_prune_min = 25
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 100
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+# V3 T49 23@0.265 most-open Abliterix
+[[optimization.seed_trials]]
+vector_scope = 'per layer'
+vector_index = 20.24678525827378
+"attn.o_proj.max_weight" = 7.823933215752146
+"attn.o_proj.max_weight_position" = 17.088251723360308
+"attn.o_proj.min_weight" = 0.8801162862720106
+"attn.o_proj.min_weight_distance" = 5.615224351882592
+"attn.qkv_proj.max_weight" = 0.43823832869373053
+"attn.qkv_proj.max_weight_position" = 17.221175884880566
+"attn.qkv_proj.min_weight" = 0.8800057461914732
+"attn.qkv_proj.min_weight_distance" = 1.2068151198350852
+"mlp.down_proj.max_weight" = 1.2948422359739233
+"mlp.down_proj.max_weight_position" = 24.146659318894752
+"mlp.down_proj.min_weight" = 0.9184347299438936
+"mlp.down_proj.min_weight_distance" = 4.9023567266588
+
+# V3 T2 28@0.239
+[[optimization.seed_trials]]
+vector_scope = 'per layer'
+vector_index = 19.31445177391378
+"attn.o_proj.max_weight" = 7.916561393640227
+"attn.o_proj.max_weight_position" = 17.084244437653982
+"attn.o_proj.min_weight" = 0.703962025086189
+"attn.o_proj.min_weight_distance" = 9.925976845053945
+"attn.qkv_proj.max_weight" = 1.711530526327425
+"attn.qkv_proj.max_weight_position" = 18.639747782493323
+"attn.qkv_proj.min_weight" = 0.9543447956198926
+"attn.qkv_proj.min_weight_distance" = 2.143618673761403
+"mlp.down_proj.max_weight" = 1.163917922006246
+"mlp.down_proj.max_weight_position" = 26.042302221446974
+"mlp.down_proj.min_weight" = 0.9271837170551674
+"mlp.down_proj.min_weight_distance" = 7.66634366178575
+
+# V3 T155 31@0.220
+[[optimization.seed_trials]]
+vector_scope = 'per layer'
+vector_index = 14.340100905308036
+"attn.o_proj.max_weight" = 7.590840248660527
+"attn.o_proj.max_weight_position" = 17.427377962596125
+"attn.o_proj.min_weight" = 0.8122106095131949
+"attn.o_proj.min_weight_distance" = 5.1773912962542985
+"attn.qkv_proj.max_weight" = 0.9202047113373137
+"attn.qkv_proj.max_weight_position" = 26.592106269926134
+"attn.qkv_proj.min_weight" = 0.8911582112084739
+"attn.qkv_proj.min_weight_distance" = 4.4217433648355335
+"mlp.down_proj.max_weight" = 0.2504945391081902
+"mlp.down_proj.max_weight_position" = 22.158097308017535
+"mlp.down_proj.min_weight" = 0.6822083806767815
+"mlp.down_proj.min_weight_distance" = 11.758583570646021
+
+# V3 T7 48@0.137 KL-mid
+[[optimization.seed_trials]]
+vector_scope = 'per layer'
+vector_index = 24.217504200723802
+"attn.o_proj.max_weight" = 7.2147895528690436
+"attn.o_proj.max_weight_position" = 16.421375643376546
+"attn.o_proj.min_weight" = 0.7909748267632432
+"attn.o_proj.min_weight_distance" = 9.193466524001947
+"attn.qkv_proj.max_weight" = 0.48276599760126465
+"attn.qkv_proj.max_weight_position" = 18.633857599263393
+"attn.qkv_proj.min_weight" = 0.9885963937989423
+"attn.qkv_proj.min_weight_distance" = 3.864113270118316
+"mlp.down_proj.max_weight" = 1.1315464434049383
+"mlp.down_proj.max_weight_position" = 25.046640683678852
+"mlp.down_proj.min_weight" = 0.9003003631158177
+"mlp.down_proj.min_weight_distance" = 6.434953921594698
+
+# Heretic T184 first-token 0@0.618 low-o no-qkv
+[[optimization.seed_trials]]
+vector_scope = 'per layer'
+vector_index = 20.052174427732975
+"attn.o_proj.max_weight" = 1.3770189718869466
+"attn.o_proj.max_weight_position" = 18.996848553763282
+"attn.o_proj.min_weight" = 0.7940131748096908
+"attn.o_proj.min_weight_distance" = 14.314579793924002
+"attn.qkv_proj.max_weight" = -0.2
+"attn.qkv_proj.max_weight_position" = 20.0
+"attn.qkv_proj.min_weight" = 0.5
+"attn.qkv_proj.min_weight_distance" = 8.0
+"mlp.down_proj.max_weight" = 1.420976122492019
+"mlp.down_proj.max_weight_position" = 26.918977603687086
+"mlp.down_proj.min_weight" = 0.6320895016712333
+"mlp.down_proj.min_weight_distance" = 14.008806090454334
+
+# Heretic T194 first-token 8@0.390 low-o no-qkv
+[[optimization.seed_trials]]
+vector_scope = 'per layer'
+vector_index = 22.81495420764406
+"attn.o_proj.max_weight" = 1.3659863474647522
+"attn.o_proj.max_weight_position" = 23.249204806289736
+"attn.o_proj.min_weight" = 0.9477715568177394
+"attn.o_proj.min_weight_distance" = 13.623463982809245
+"attn.qkv_proj.max_weight" = -0.2
+"attn.qkv_proj.max_weight_position" = 20.0
+"attn.qkv_proj.min_weight" = 0.5
+"attn.qkv_proj.min_weight_distance" = 8.0
+"mlp.down_proj.max_weight" = 1.3881107323869368
+"mlp.down_proj.max_weight_position" = 26.968043368243084
+"mlp.down_proj.min_weight" = 0.13193224438864298
+"mlp.down_proj.min_weight_distance" = 13.431656605936858
+
+# Heretic T52 first-token 6@0.439 low-o
+[[optimization.seed_trials]]
+vector_scope = 'per layer'
+vector_index = 12.579847065908845
+"attn.o_proj.max_weight" = 1.482388733750317
+"attn.o_proj.max_weight_position" = 22.197208694316192
+"attn.o_proj.min_weight" = 0.9713876979802292
+"attn.o_proj.min_weight_distance" = 15.615607434022678
+"attn.qkv_proj.max_weight" = -0.2
+"attn.qkv_proj.max_weight_position" = 20.0
+"attn.qkv_proj.min_weight" = 0.5
+"attn.qkv_proj.min_weight_distance" = 8.0
+"mlp.down_proj.max_weight" = 0.1722708441471732
+"mlp.down_proj.max_weight_position" = 25.14716703371587
+"mlp.down_proj.min_weight" = 0.40828753036372534
+"mlp.down_proj.min_weight_distance" = 12.861272539336614
+
+# V3 T181 73@0.091 KL-cheap
+[[optimization.seed_trials]]
+vector_scope = 'global'
+vector_index = 17.970699510554706
+"attn.o_proj.max_weight" = 7.863190479730182
+"attn.o_proj.max_weight_position" = 18.371749799528427
+"attn.o_proj.min_weight" = 0.8027147594991763
+"attn.o_proj.min_weight_distance" = 5.644678781372616
+"attn.qkv_proj.max_weight" = 0.9616030741528103
+"attn.qkv_proj.max_weight_position" = 18.492353895096233
+"attn.qkv_proj.min_weight" = 0.7583041164858302
+"attn.qkv_proj.min_weight_distance" = 1.8292739708894339
+"mlp.down_proj.max_weight" = 1.3296388506202623
+"mlp.down_proj.max_weight_position" = 25.477288266114833
+"mlp.down_proj.min_weight" = 0.6928492254640419
+"mlp.down_proj.min_weight_distance" = 5.438008500557354
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.1
+prune_threshold = 0.6
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

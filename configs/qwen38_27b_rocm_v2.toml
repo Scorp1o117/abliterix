@@ -1,0 +1,94 @@
+# Qwen3.8-27B v2 — residual peel on v1 trial 23.
+#
+# v1 best: trial 23, 17/100 refusals, search KL 0.181 (baseline 100/100).
+# Native iterative + LoRA hits IndexError; this is the Qwen3.6-27B V4
+# manual peel: new extract on the already-abliterated t23 merge, then a
+# weaker TPE pass. Incremental KL budget ~0.02 on top of 0.18.
+# Target still ≤10/100 @ KL 0.05 vs the original (cumulative).
+
+[model]
+model_id = "/run/media/s117/OS/Models/Qwen3.8-27B-t23"
+dtype_fallback_order = ["float16"]
+quant_method = "bnb_4bit"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "80GB", "cpu" = "20GB"}
+custom_encoder_module = "scripts/qwen38_encode.py"
+custom_encoder_kwargs = {enable_thinking = false}
+
+[inference]
+batch_size = 256
+min_batch_size = 1
+max_batch_size = 256
+skip_common_response_prefix = false
+min_gen_tokens = 32
+max_gen_tokens = 160
+
+[steering]
+steering_mode = "lora"
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "none"
+strength_range = [0.3, 5.0]
+disabled_components = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [0.3, 5.0]
+"mlp.down_proj" = [0.0, 2.0]
+
+[optimization]
+num_trials = 30
+num_warmup_trials = 8
+sampler_seed = 23
+checkpoint_dir = "checkpoints_qwen38_27b_v2"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 16
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01
+prune_threshold = 0.5
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = true
+overwrite_checkpoint = true
+system_prompt = "You are a helpful assistant."
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

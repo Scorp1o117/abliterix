@@ -1,0 +1,118 @@
+# Qwen3.8-27B MPOA probe: weight_normalization=full (rank-3 SVD row-norm).
+# Same 3-token / BF16 / batch 128 / keyword meter as pocket. 30/10.
+# Caches reused from checkpoints_qwen38_27b_pocket (same original base).
+
+[model]
+model_id = "/run/media/s117/OS/Models/Qwen3.8-27B"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+max_memory = {0 = "110GB", "cpu" = "8GB"}
+trust_remote_code = true
+custom_encoder_module = "scripts/qwen38_encode.py"
+custom_encoder_kwargs = {enable_thinking = false}
+
+[inference]
+batch_size = 128
+min_batch_size = 1
+max_batch_size = 128
+skip_common_response_prefix = true
+min_gen_tokens = 32
+max_gen_tokens = 160
+
+[steering]
+steering_mode = "lora"
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "full"
+full_norm_lora_rank = 3
+strength_range = [1.0, 5.0]
+disabled_components = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [3.8, 6.0]
+"mlp.down_proj" = [0.0, 2.8]
+
+[optimization]
+num_trials = 30
+num_warmup_trials = 10
+sampler_seed = 117
+checkpoint_dir = "checkpoints_qwen38_27b_mpoa"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 16
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+# pocket t24: 50/100 @ 0.0866 vs original
+[[optimization.seed_trials]]
+vector_scope = "global"
+vector_index = 50.79667354766495
+"attn.o_proj.max_weight" = 5.730166088977851
+"attn.o_proj.max_weight_position" = 49.611242819678694
+"attn.o_proj.min_weight" = 0.5795895850105235
+"attn.o_proj.min_weight_distance" = 5.105344096840982
+"mlp.down_proj.max_weight" = 0.3688861764193173
+"mlp.down_proj.max_weight_position" = 37.89393126916791
+"mlp.down_proj.min_weight" = 0.6716037377983707
+"mlp.down_proj.min_weight_distance" = 30.46113365251766
+
+# repaired t50 knobs (40est@0.093 vs repaired)
+[[optimization.seed_trials]]
+vector_scope = "global"
+vector_index = 51.24
+"attn.o_proj.max_weight" = 4.11
+"attn.o_proj.max_weight_position" = 53.39
+"attn.o_proj.min_weight" = 0.80
+"attn.o_proj.min_weight_distance" = 17.42
+"mlp.down_proj.max_weight" = 0.69
+"mlp.down_proj.max_weight_position" = 57.97
+"mlp.down_proj.min_weight" = 0.57
+"mlp.down_proj.min_weight_distance" = 29.83
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.005
+prune_threshold = 0.5
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = true
+overwrite_checkpoint = false
+system_prompt = "You are a helpful assistant."
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

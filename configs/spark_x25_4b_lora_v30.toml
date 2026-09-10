@@ -1,0 +1,135 @@
+# Spark-X2.5-4B — V30 hard Optuna search (mergeable mean LoRA)
+#
+# Official Heretic 2.0 (max_weight cap 1.5) and T9 adapter both missed the
+# Abliterix dual bar. Distinct recipes after V9 (n_dir, leftover, HH grids,
+# COSMIC, OT, paired, SOM, ARA, CGA) did not produce a bakeable dual HIT.
+# This run is a larger V9-family search with honest full-100 scoring:
+#   - same mean LoRA rank-8 full-norm + projected abliteration
+#   - o_proj widened to [2.0, 8.0] (V9 was [2.5, 6.5])
+#   - prescreen only prunes hopeless 25+/30; everything else full-evals
+#     (V9 estimated borderline 9–18/30, including T32)
+#   - seed V9 T32 (KL-efficient) and T31 (more open)
+# Dual HIT: refusals ≤10/100 and 3-token KL ≤0.10 vs original.
+# non_interactive: no auto-bake. Merge only on HIT.
+
+non_interactive = true
+overwrite_checkpoint = false
+system_prompt = "You are a helpful assistant."
+
+[model]
+model_id = "/run/media/s117/OS/Models/Spark-X2.5-4B"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+trust_remote_code = true
+
+[inference]
+batch_size = 64
+min_batch_size = 1
+max_batch_size = 64
+max_gen_tokens = 150
+skip_common_response_prefix = true
+
+[steering]
+vector_method = "mean"
+steering_mode = "lora"
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+discriminative_layer_selection = true
+decay_kernel = "gaussian"
+weight_normalization = "full"
+full_norm_lora_rank = 8
+orthogonal_projection = true
+strength_range = [0.8, 8.0]
+auto_disable_components = ["mlp.down_proj"]
+auto_disable_floor = -0.3
+disabled_components = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
+
+[steering.component_strength_ranges]
+"attn.o_proj" = [2.0, 8.0]
+"attn.qkv_proj" = [0.3, 4.5]
+"mlp.down_proj" = [0.0, 1.4]
+
+[optimization]
+num_trials = 800
+num_warmup_trials = 24
+checkpoint_dir = "checkpoints_spark_x25_4b_lora_v30"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 24
+refusal_prescreen_prune_min = 25
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 100
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+# V9 T32: 18/30 est ~60 @ KL 0.0456, o≈5.97 qkv≈1.07 per-layer
+[[optimization.seed_trials]]
+vector_scope = "per layer"
+vector_index = 26.78
+"attn.o_proj.max_weight" = 5.967085842402718
+"attn.o_proj.max_weight_position" = 26.780726743513593
+"attn.o_proj.min_weight" = 0.758575
+"attn.o_proj.min_weight_distance" = 13.007821106912552
+"attn.qkv_proj.max_weight" = 1.072505357674391
+"attn.qkv_proj.max_weight_position" = 27.562640953633696
+"attn.qkv_proj.min_weight" = 0.20749
+"attn.qkv_proj.min_weight_distance" = 17.016865110851832
+"mlp.down_proj.max_weight" = 0.08301810666258133
+"mlp.down_proj.max_weight_position" = 34.80161635179428
+"mlp.down_proj.min_weight" = 0.96427
+"mlp.down_proj.min_weight_distance" = 9.383908418830279
+
+# V9 T31: 9/30 est ~30 @ KL 0.148, o≈6.35
+[[optimization.seed_trials]]
+vector_scope = "per layer"
+vector_index = 23.23
+"attn.o_proj.max_weight" = 6.349040360624608
+"attn.o_proj.max_weight_position" = 23.228046295193852
+"attn.o_proj.min_weight" = 0.93497
+"attn.o_proj.min_weight_distance" = 15.588649626812025
+"attn.qkv_proj.max_weight" = 0.9878214299413829
+"attn.qkv_proj.max_weight_position" = 29.637775638140333
+"attn.qkv_proj.min_weight" = 0.23145
+"attn.qkv_proj.min_weight_distance" = 18.833526368223467
+"mlp.down_proj.max_weight" = 0.0
+"mlp.down_proj.max_weight_position" = 33.860724427924424
+"mlp.down_proj.min_weight" = 0.0
+"mlp.down_proj.min_weight_distance" = 8.486721532309733
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.05
+prune_threshold = 0.25
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+[benign_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/good_1000"
+split = "train[900:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "/run/media/s117/OS/Users/15403/Documents/abliterix-datasets/harmful_1000"
+split = "train[900:]"
+column = "prompt"

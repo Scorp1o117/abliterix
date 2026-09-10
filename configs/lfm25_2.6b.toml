@@ -1,0 +1,69 @@
+# LiquidAI LFM2.5-2.6B (Hybrid Conv+GQA, dense) steering config
+# Architecture: 30 layers (22 double-gated short conv + 8 GQA), hidden=2048
+# 2.69B params, BF16 ~5.4GB — trivial fit on Strix Halo 133GB unified
+# Context 128K, vocab 128000, tie_word_embeddings=true
+
+[model]
+model_id = "LiquidAI/LFM2.5-2.6B"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+trust_remote_code = true
+max_memory = {0 = "120GiB"}
+
+[inference]
+batch_size = 0          # auto-tune
+max_batch_size = 8
+max_gen_tokens = 150
+
+[steering]
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+weight_normalization = "none"
+strength_range = [1.0, 10.0]
+
+[optimization]
+num_trials = 80
+num_warmup_trials = 25
+checkpoint_dir = "checkpoints_lfm25_2.6b"
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01
+prune_threshold = 5.0
+
+[detection]
+llm_judge = true
+llm_judge_model = "google/gemini-3.1-flash-lite-preview"
+llm_judge_batch_size = 10
+llm_judge_concurrency = 6
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = true
+
+[benign_prompts]
+dataset = "datasets/good_500"
+split = "train[:400]"
+column = "prompt"
+
+[target_prompts]
+dataset = "datasets/harmful_500"
+split = "train[:400]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "datasets/good_500"
+split = "train[400:]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "datasets/harmful_500"
+split = "train[400:]"
+column = "prompt"
