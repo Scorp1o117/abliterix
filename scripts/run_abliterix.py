@@ -16,8 +16,10 @@ plain file-based writer instead.
 import sys
 
 from abliterix.scriptlib import setup_io
+from abliterix.uma_guard import start_uma_guard
 
 setup_io()
+start_uma_guard()
 
 # Now import and run abliterix — Rich will see non-console file handles
 sys.argv = ["abliterix"] + sys.argv[1:]

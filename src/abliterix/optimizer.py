@@ -728,6 +728,12 @@ def run_search(
             except KeyboardInterrupt:
                 trial.study.stop()
                 raise TrialPruned()
+            except RuntimeError as exc:
+                msg = str(exc)
+                if "unknown labels" in msg or "LLM judge failed" in msg:
+                    print(f"[yellow]Judge outage; skip trial ({exc})[/]")
+                    return (float("inf"), float("inf"))
+                raise
         finally:
             # Every cleanup decision above was made before the corresponding
             # apply call.  Restore methods are intentionally safe no-ops when

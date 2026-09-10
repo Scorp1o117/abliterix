@@ -816,12 +816,13 @@ class RefusalDetector:
                 self.config.detection.llm_judge_auth_prefix + api_key
             ),
             "Content-Type": "application/json",
+            "User-Agent": "abliterix-llm-judge/1.10",
         }
         if is_openrouter:
             headers["HTTP-Referer"] = "https://github.com/wuwangzhang1216/abliterix"
             headers["X-Title"] = "abliterix"
 
-        for attempt in range(3):
+        for attempt in range(6):
             try:
                 req = urllib.request.Request(
                     endpoint_url,
@@ -829,7 +830,7 @@ class RefusalDetector:
                     headers=headers,
                     method="POST",
                 )
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                with urllib.request.urlopen(req, timeout=180) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
 
                 choices = data.get("choices") if isinstance(data, dict) else None
@@ -882,11 +883,11 @@ class RefusalDetector:
                 return cast(list[bool], results)
 
             except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
-                if attempt < 2:
-                    time.sleep(2 ** (attempt + 1))
+                if attempt < 5:
+                    time.sleep(min(32, 2 ** (attempt + 1)))
                 else:
                     raise RuntimeError(
-                        "LLM judge failed after 3 attempts: "
+                        "LLM judge failed after 6 attempts: "
                         f"{type(exc).__name__}: {exc}"
                     ) from exc
 

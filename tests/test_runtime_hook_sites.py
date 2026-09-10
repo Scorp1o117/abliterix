@@ -73,6 +73,7 @@ def test_angular_overrotation_is_opt_in_and_crosses_the_tangent():
     clamped = _make_angular_hook(direction, 135.0)(None, (), hidden)
     overrotated = _make_angular_hook(
         direction, 135.0, allow_overrotation=True
+    )
     )(None, (), hidden)
 
     assert abs(clamped[0, 0].item()) < 1e-6

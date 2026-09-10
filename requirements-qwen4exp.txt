@@ -1,0 +1,5 @@
+# Pin for Qwen3.8-Flash-Next / model_type=qwen4_exp.
+# transformers 5.12.x in heretic-env did not ship the architecture.
+# 5.16.1 (2026-08-26) includes Qwen4ExpForConditionalGeneration and
+# _no_placement_params for the PLE n-gram table.
+transformers==5.16.1

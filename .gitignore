@@ -104,6 +104,12 @@ experiments*/
 .claude/
 
 # ========================
+# Lab working dirs (private — run logs, metric dumps, exported deltas)
+# ========================
+/logs/
+/exports/
+
+# ========================
 # Paper (private working dir — drafts, raw experiment data, GPU logs)
 # ========================
 /paper/

@@ -38,6 +38,21 @@ from ..settings import AbliterixConfig
 from ..types import ChatMessage, QuantMode, SteeringMode, VectorMethod, WeightNorm
 from ..util import chunk_batches, flush_memory, print
 from . import fp8_utils
+from .qwen4exp_runtime import (
+    assemble_writeback_hidden_sequence,
+    collect_writeback_hidden_states,
+    device_map_keeping_ngram_on_host,
+    full_precision_merge_refusal,
+    is_ngram_parameter_name,
+    iter_bnb_linear_targets,
+    model_type_from_id,
+    move_parameters_skipping_ngram,
+    pin_ngram_parameters_to_host,
+    preflight_qwen4exp_load,
+    stack_residual_rows,
+    uses_writeback_residual_capture,
+    writeback_hidden_size,
+)
 
 # transformers < 5.0 uses torch_dtype=, >= 5.0 uses dtype= in from_pretrained.
 import transformers as _tf
@@ -139,6 +154,9 @@ def resolve_model_class(
     if config.get("model_type") == "qwen3_5_moe":
         return AutoModelForCausalLM
 
+    # Flash-Next is a VL wrapper around the text MoE. Abliterix steers only
+    # the language model; ImageTextToText is still required so AutoConfig
+    # binds Qwen4ExpForConditionalGeneration.
     if any("vision_config" in cfg for cfg in config_dicts if isinstance(cfg, dict)):
         return AutoModelForImageTextToText
     return AutoModelForCausalLM
@@ -389,6 +407,9 @@ class SteeringEngine:
     peft_config: LoraConfig
 
     def __init__(self, config: AbliterixConfig):
+        from ..uma_guard import start_uma_guard
+
+        start_uma_guard()
         self.config = config
         self.response_prefix = ""
         self.needs_reload = False
@@ -427,6 +448,15 @@ class SteeringEngine:
         # appear after the prompt — otherwise the model treats them as valid
         # continuation tokens and produces empty outputs.
         self.tokenizer.padding_side = "left"
+
+        # Muse / long-context checkpoints advertise 131k max_length. On UMA
+        # that value leaking into generation_config preallocates a huge cache.
+        _seq_cap = int(os.environ.get("ABLITERIX_MAX_SEQ", "0") or 0)
+        if _seq_cap > 0:
+            self.tokenizer.model_max_length = min(
+                int(self.tokenizer.model_max_length or _seq_cap),
+                _seq_cap,
+            )
 
         # Custom encoder: models like DeepSeek-V4 ship a Python encoding
         # script instead of a Jinja chat_template. Monkey-patch
@@ -521,6 +551,15 @@ class SteeringEngine:
             self._fused_down_proj_transposed = False
 
         is_fp8 = config.model.quant_method == QuantMode.FP8 or self._is_native_fp8
+
+        # Qwen4Exp / Flash-Next: fused 3-D experts stay BF16 under bitsandbytes
+        # and the 95G n-gram table is an Embedding. Refuse before mmap storms
+        # the UMA pool. Override with ABLITERIX_QWEN4EXP_ALLOW_LOAD=1.
+        preflight_qwen4exp_load(
+            model_id,
+            quantize_fused_experts=False,
+            skip_ngram=True,
+        )
 
         # Workaround: transformers FP8 quantizer accesses config.intermediate_size
         # as a fallback when moe_intermediate_size is absent. Some MoE model configs
@@ -650,6 +689,19 @@ class SteeringEngine:
                     flush_memory()
                     print("  [dim]bnb: flushed allocator caches after weight load[/]")
 
+                _seq_cap = int(os.environ.get("ABLITERIX_MAX_SEQ", "0") or 0)
+                gen_cfg = getattr(self.model, "generation_config", None)
+                if _seq_cap > 0 and gen_cfg is not None:
+                    gen_cfg.max_length = min(
+                        int(getattr(gen_cfg, "max_length", _seq_cap) or _seq_cap),
+                        _seq_cap,
+                    )
+                    if hasattr(gen_cfg, "max_tokens"):
+                        gen_cfg.max_tokens = min(
+                            int(getattr(gen_cfg, "max_tokens", _seq_cap) or _seq_cap),
+                            _seq_cap,
+                        )
+
                 # Smoke-test: a single forward pass catches dtype-related
                 # runtime errors (inf/nan probability tensors, etc.).
                 self._generate(
@@ -762,35 +814,52 @@ class SteeringEngine:
             and not is_fp8
         )
         if not use_fast:
-            return resolve_model_class(model_id).from_pretrained(
+            # Recipe path: bnb_4bit + device_map=auto + max_memory.  Stock
+            # from_pretrained would place 128 PLE shards independently — each
+            # ~800 MiB fits the GPU budget so the 95G table clones onto UMA.
+            device_map = self.config.model.device_map
+            if model_type_from_id(model_id) in {"qwen4_exp", "qwen4_exp_text"}:
+                device_map = device_map_keeping_ngram_on_host(
+                    model_id, device_map, self.max_memory
+                )
+                print("  [dim]qwen4exp: n-gram modules pinned to CPU in device_map[/]")
+            model = resolve_model_class(model_id).from_pretrained(
                 model_id,
                 **{_dtype_kwarg: dtype},
-                device_map=self.config.model.device_map,
+                device_map=device_map,
                 max_memory=self.max_memory,
                 trust_remote_code=self.trusted_models.get(model_id),
                 offload_folder="/tmp/offload",
                 **extra,
             )
+            skipped = pin_ngram_parameters_to_host(model)
+            if skipped:
+                print(
+                    f"  [dim]qwen4exp: moved {skipped} n-gram/PLE tensors back to host[/]"
+                )
+            return model
 
-        print("  [dim]fast load: CPU mmap -> materialize -> bulk CUDA[/]")
+        print("  [dim]fast load: mmap -> per-storage CUDA (no 2× CPU copy)[/]")
+        extra = {**extra}
+        extra.setdefault("low_cpu_mem_usage", True)
         model = resolve_model_class(model_id).from_pretrained(
             model_id,
             **{_dtype_kwarg: dtype},
             trust_remote_code=self.trusted_models.get(model_id),
             **extra,
         )
-        # Materialize lazy mmap-backed safetensors pages into plain
-        # memory; keep shared storages (tied embeddings) shared.
-        with torch.no_grad():
-            clones: dict[int, Tensor] = {}
-            for p in model.parameters():
-                if p.data.storage().size() == 0:
-                    continue
-                key = p.data.storage().data_ptr()
-                if key not in clones:
-                    clones[key] = p.data.clone()
-                p.data = clones[key]
-        return model.to("cuda")
+        # Stream unique storages to GPU and drop the CPU/mmap alias so a
+        # 67G MoE does not peak at 2× weights (accelerate device_map=auto
+        # plus max_memory was doing that and UMA-killing Ornith-1.5).
+        # Qwen4Exp PLE n-gram shards stay on the host: a bulk .to("cuda")
+        # would clone ~95 GiB into the UMA pool.
+        moved, skipped = move_parameters_skipping_ngram(model, device="cuda")
+        if skipped:
+            print(
+                f"  [dim]qwen4exp: left {skipped} n-gram/PLE tensors on host "
+                f"({moved} moved to CUDA)[/]"
+            )
+        return model
 
     def _load_model_bnb_fast(
         self,
@@ -845,11 +914,7 @@ class SteeringEngine:
             **extra,
         )
 
-        targets = [
-            (name, mod)
-            for name, mod in model.named_modules()
-            if isinstance(mod, torch.nn.Linear)
-        ]
+        targets = iter_bnb_linear_targets(model)
         print(f"  [dim]bnb fast: quantizing {len(targets)} Linear weights on CPU[/]")
 
         def _quantize(name_mod: tuple[str, Module]) -> tuple:
@@ -909,7 +974,9 @@ class SteeringEngine:
                 gc.collect()
         print(f"  [dim]bnb fast: quantized+swapped {done} weights[/]")
 
-        return model.to("cuda")
+        # Do not model.to("cuda"): that would clone the PLE n-gram table.
+        move_parameters_skipping_ngram(model, device="cuda")
+        return model
 
     # ------------------------------------------------------------------
     # FP8 dequantization workaround
@@ -1142,7 +1209,11 @@ class SteeringEngine:
                     if path is not None:
                         target_paths.add(path)
 
-        targets = sorted(target_paths)
+        targets = sorted(
+            path
+            for path in target_paths
+            if not is_ngram_parameter_name(path)
+        )
 
         rank = _required_lora_rank(self.config)
 
@@ -1404,9 +1475,14 @@ class SteeringEngine:
         with suppress(Exception):
             _register("conv.out_proj", layer.conv.out_proj)  # ty:ignore[possibly-missing-attribute]
 
-        # LFM2 MoE — attention output projection (named out_proj, not o_proj).
+        # LFM2 MoE / Spark-X2.5 — attention output projection (named out_proj, not o_proj).
         with suppress(Exception):
             _register("attn.o_proj", layer.self_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
+
+        # Spark-X2.5 fused QKV (no separate q/k/v_proj). Optional; configs can
+        # disable attn.qkv_proj to keep the classic o_proj + down_proj search.
+        with suppress(Exception):
+            _register("attn.qkv_proj", layer.self_attn.q_k_v_proj)  # ty:ignore[possibly-missing-attribute]
 
         # LFM2 MoE — dense MLP down-projection (layers 0-1, w2 naming).
         with suppress(Exception):
@@ -1781,6 +1857,13 @@ class SteeringEngine:
                 "represented by a merged checkpoint. Export a runtime artifact "
                 "or choose 'lora'/'direct' instead."
             )
+
+        merge_block = full_precision_merge_refusal(
+            getattr(self.config.model, "model_id", None),
+            getattr(self.model, "config", None),
+        )
+        if merge_block:
+            raise RuntimeError(merge_block)
 
         quantized = self.config.model.quant_method in (
             QuantMode.BNB_4BIT,
@@ -2479,17 +2562,16 @@ class SteeringEngine:
             )
             self._logits_to_keep_support = cache
 
-        forward_kwargs: dict[str, Any] = {"output_hidden_states": True}
+        forward_kwargs: dict[str, Any] = {
+            "output_hidden_states": True,
+            "use_cache": False,
+        }
         if cache[1]:
             forward_kwargs["logits_to_keep"] = 1
 
-        outputs = self.model(**inputs, **forward_kwargs)
-        hidden_states = outputs.hidden_states
-
-        residuals = torch.stack(
-            [hs[:, token_offset, :] for hs in hidden_states],
-            dim=1,
-        ).to(torch.float32)
+        residuals = self._stack_forward_residuals(
+            inputs, forward_kwargs, token_offset=token_offset
+        )
 
         q = self.config.steering.outlier_quantile
         if 0 <= q < 1:
@@ -2502,6 +2584,93 @@ class SteeringEngine:
             return torch.clamp(residuals, -thresholds, thresholds)
 
         return residuals
+
+    def _stack_forward_residuals(
+        self,
+        inputs: dict[str, Any],
+        forward_kwargs: dict[str, Any],
+        *,
+        token_offset: int,
+    ) -> Tensor:
+        """Capture per-layer residuals in projection write-back width.
+
+        Gated-residual Qwen4Exp decoder layers emit ``hc_count * hidden_size``
+        (10240).  ``o_proj`` / ``out_proj`` / ``down_proj`` write 2560.  A
+        mixed ``torch.stack`` is rejected; hooks collect the 2560-d write-backs
+        instead.
+        """
+        writeback_dim = writeback_hidden_size(getattr(self.model, "config", None))
+        use_writeback = uses_writeback_residual_capture(self.model)
+
+        def _forward():
+            return self.model(**inputs, **forward_kwargs)
+
+        if use_writeback:
+            if writeback_dim is None:
+                raise RuntimeError(
+                    "Gated-residual model has no hidden_size; cannot capture "
+                    "2560-d write-back residuals."
+                )
+            per_layer, outputs = collect_writeback_hidden_states(
+                self.transformer_layers,
+                _forward,
+                writeback_dim=writeback_dim,
+            )
+            hidden_seq = assemble_writeback_hidden_sequence(
+                per_layer, outputs, writeback_dim=writeback_dim
+            )
+            return stack_residual_rows(
+                hidden_seq, token_offset, writeback_dim=writeback_dim
+            ).to(torch.float32)
+
+        outputs = _forward()
+        hidden_states = outputs.hidden_states
+        return stack_residual_rows(
+            hidden_states, token_offset, writeback_dim=writeback_dim
+        ).to(torch.float32)
+
+    def _forward_hidden_sequence(
+        self,
+        inputs: dict[str, Any],
+        forward_kwargs: dict[str, Any],
+    ) -> list[Tensor]:
+        """Return ``[embed, *per_layer]`` hidden tensors in write-back width."""
+        writeback_dim = writeback_hidden_size(getattr(self.model, "config", None))
+
+        def _forward():
+            return self.model(**inputs, **forward_kwargs)
+
+        if uses_writeback_residual_capture(self.model):
+            if writeback_dim is None:
+                raise RuntimeError(
+                    "Gated-residual model has no hidden_size; cannot capture "
+                    "2560-d write-back residuals."
+                )
+            per_layer, outputs = collect_writeback_hidden_states(
+                self.transformer_layers,
+                _forward,
+                writeback_dim=writeback_dim,
+            )
+            return assemble_writeback_hidden_sequence(
+                per_layer, outputs, writeback_dim=writeback_dim
+            )
+
+        outputs = _forward()
+        hidden_seq = list(outputs.hidden_states)
+        widths = {int(h.shape[-1]) for h in hidden_seq}
+        if len(widths) != 1:
+            raise RuntimeError(
+                "Cannot use hidden_states with mixed last-dims "
+                f"{sorted(widths)}; gated-residual models must use 2560-d "
+                "write-back capture, not the 10240-d four-branch layer output."
+            )
+        if writeback_dim is not None and widths != {writeback_dim}:
+            raise RuntimeError(
+                f"Residual last-dim {next(iter(widths))} is not write-back "
+                f"width {writeback_dim}; refusing a 10240-d stack on 2560-d "
+                "projections."
+            )
+        return hidden_seq
 
     def extract_hidden_states_batched(
         self,
@@ -2560,13 +2729,45 @@ class SteeringEngine:
             messages, continuation
         )
         self._reset_position_cache()
-        forward_kwargs: dict[str, Any] = {"output_hidden_states": True}
+        forward_kwargs: dict[str, Any] = {
+            "output_hidden_states": True,
+            "use_cache": False,
+        }
         if _forward_supports_logits_to_keep(cast(Module, self.model)):
             forward_kwargs["logits_to_keep"] = 1
-        outputs = self.model(**inputs, **forward_kwargs)
+
+        writeback_dim = writeback_hidden_size(getattr(self.model, "config", None))
+        if uses_writeback_residual_capture(self.model):
+            if writeback_dim is None:
+                raise RuntimeError(
+                    "Gated-residual model has no hidden_size; cannot capture "
+                    "2560-d continuation residuals."
+                )
+
+            def _forward():
+                return self.model(**inputs, **forward_kwargs)
+
+            per_layer, outputs = collect_writeback_hidden_states(
+                self.transformer_layers,
+                _forward,
+                writeback_dim=writeback_dim,
+            )
+            hidden_seq = assemble_writeback_hidden_sequence(
+                per_layer, outputs, writeback_dim=writeback_dim
+            )
+        else:
+            outputs = self.model(**inputs, **forward_kwargs)
+            hidden_seq = list(outputs.hidden_states)
+            widths = {int(h.shape[-1]) for h in hidden_seq}
+            if len(widths) != 1:
+                raise RuntimeError(
+                    "Cannot torch.stack continuation residuals with mixed "
+                    f"last-dims {sorted(widths)}; gated-residual models must "
+                    "use 2560-d write-back capture."
+                )
 
         pooled_layers = []
-        for hidden in outputs.hidden_states:
+        for hidden in hidden_seq:
             rows = []
             for row, length in zip(hidden, continuation_lengths.tolist()):
                 response_tokens = row[-length:, :]
@@ -2647,13 +2848,16 @@ class SteeringEngine:
             messages, continuations
         )
         self._reset_position_cache()
-        forward_kwargs: dict[str, Any] = {"output_hidden_states": True}
+        forward_kwargs: dict[str, Any] = {
+            "output_hidden_states": True,
+            "use_cache": False,
+        }
         if _forward_supports_logits_to_keep(cast(Module, self.model)):
             forward_kwargs["logits_to_keep"] = 1
-        outputs = self.model(**inputs, **forward_kwargs)
+        hidden_seq = self._forward_hidden_sequence(inputs, forward_kwargs)
 
         token_layers = []
-        for hidden in outputs.hidden_states:
+        for hidden in hidden_seq:
             rows = []
             for row, length_tensor in zip(hidden, continuation_lengths):
                 length = int(length_tensor.item())

@@ -352,8 +352,27 @@ def _handle_existing_checkpoint(
             # Preserve runtime flags that aren't part of the experiment config.
             restored.non_interactive = config.non_interactive
             restored.overwrite_checkpoint = config.overwrite_checkpoint
+            # File/CLI can raise the trial budget on resume (journal freezes
+            # the original num_trials).
+            incoming_n = config.optimization.num_trials
+            if incoming_n > restored.optimization.num_trials:
+                restored.optimization.num_trials = incoming_n
             return restored, storage
         else:
+            incoming_n = config.optimization.num_trials
+            restored = AbliterixConfig.model_validate_json(
+                existing_study.user_attrs["settings"],
+            )
+            restored.non_interactive = config.non_interactive
+            restored.overwrite_checkpoint = config.overwrite_checkpoint
+            if incoming_n > restored.optimization.num_trials:
+                restored.optimization.num_trials = incoming_n
+                print()
+                print(
+                    "[yellow]Non-interactive mode: checkpoint finished; "
+                    f"raising trial budget to {incoming_n} and continuing.[/]"
+                )
+                return restored, storage
             print()
             print(
                 "[red]Non-interactive mode: checkpoint already finished and "
@@ -542,6 +561,11 @@ def _detect_response_prefix(
                 "<|channel|>analysis<|message|><|end|><|start|>assistant"
                 "<|channel|>final<|message|>"
             ),
+            # Muse Glimmer / Onyx ATEM: generation starts at <|start|>assistant
+            # and the model writes ` to=self` for policy CoT. Force the user
+            # channel so refusal is decided at the last prompt token.
+            " to=self": " to=user",
+            "to=self": "to=user",
         }
         matched_early = False
         for pattern, replacement in _KNOWN_COT_PREFIXES.items():
@@ -582,6 +606,10 @@ def _detect_response_prefix(
             engine.response_prefix = "<thought></thought>"
         elif engine.response_prefix.startswith("[THINK]"):
             engine.response_prefix = "[THINK][/THINK]"
+        elif engine.response_prefix.startswith(" to=self"):
+            engine.response_prefix = " to=user"
+        elif engine.response_prefix.startswith("to=self"):
+            engine.response_prefix = "to=user"
         else:
             recheck = False
 
@@ -2257,6 +2285,9 @@ def run():
 
 def main():
     install()  # Rich traceback handler.
+    from .uma_guard import start_uma_guard
+
+    start_uma_guard()
 
     try:
         run()

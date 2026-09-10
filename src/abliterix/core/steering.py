@@ -320,6 +320,7 @@ def _make_angular_pre_hook(
     direction: Tensor,
     angle_degrees: float,
     adaptive: bool = False,
+    allow_overrotation: bool = False,
 ):
     """Adapt the angular output hook to a module forward-pre-hook.
 
@@ -327,7 +328,12 @@ def _make_angular_pre_hook(
     normalisation module (for example Ling's post-attention residual before
     ``post_attention_layernorm``).
     """
-    output_hook = _make_angular_hook(direction, angle_degrees, adaptive=adaptive)
+    output_hook = _make_angular_hook(
+        direction,
+        angle_degrees,
+        adaptive=adaptive,
+        allow_overrotation=allow_overrotation,
+    )
 
     def pre_hook(module, args):
         if not args:
@@ -1624,8 +1630,16 @@ def _apply_angular_steering(
                 strength = sp.max_weight + t * (sp.min_weight - sp.max_weight)
 
         # Strength is the fraction of full directional removal.  The hook
-        # clamps values above 1.0 at the 90° removal tangent.
+        # clamps values above 1.0 at the 90° removal tangent unless
+        # angular_overrotation (or the gated flag) is on.
         angle = strength * 90.0
+        allow_overrotation = bool(
+            config.steering.angular_overrotation
+            or (
+                concept_scorers is not None
+                and config.steering.concept_gate_angular_overrotation
+            )
+        )
 
         if global_vector is None:
             if steering_vectors.ndim == 3:
@@ -1679,10 +1693,14 @@ def _apply_angular_steering(
                 else hook_module.register_forward_hook(hook)
             )
         elif use_pre_hook:
-            hook = _make_angular_pre_hook(v, angle, adaptive=adaptive)
+            hook = _make_angular_pre_hook(
+                v, angle, adaptive=adaptive, allow_overrotation=allow_overrotation
+            )
             handle = hook_module.register_forward_pre_hook(hook)
         else:
-            hook = _make_angular_hook(v, angle, adaptive=adaptive)
+            hook = _make_angular_hook(
+                v, angle, adaptive=adaptive, allow_overrotation=allow_overrotation
+            )
             handle = hook_module.register_forward_hook(hook)
         engine._angular_hooks.append(handle)
         installed += 1

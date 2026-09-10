@@ -748,6 +748,16 @@ class SteeringConfig(BaseModel):
         ),
     )
 
+    angular_overrotation: bool = Field(
+        default=False,
+        description=(
+            "Allow plain angular / adaptive-angular strength above 1.0 to "
+            "continue past the 90-degree removal tangent, up to fraction 2.0 "
+            "(180 degrees). Default false keeps the historical clamp. "
+            "Concept-gated angular uses concept_gate_angular_overrotation."
+        ),
+    )
+
     concept_gate_angular_overrotation: bool = Field(
         default=False,
         description=(
