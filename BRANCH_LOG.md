@@ -11,7 +11,58 @@
 | 远端 | `origin` → https://github.com/Scorp1o117/abliterix |
 | 上游 | `upstream` → https://github.com/wuwangzhang1216/abliterix |
 | 最近对齐上游 | **v1.12.2**（`5d58cea`，merge `bb48dd9`）——已追平上游 `master` |
-| 本日志最近更新 | 2026-09-10 (对齐上游 v1.12.2 + WIP 入库) |
+| 本日志最近更新 | 2026-09-10 (Nex-N2.5-mini 消融开工 + direct/EGA 结论) |
+
+---
+
+## -1cp. 2026-09-10 — Nex-N2.5-mini 消融开工：direct/EGA vs LoRA 的 A/B
+
+**背景**：Nex-N2.5-mini（Nex-AGI，Qwen3.5-35B-A3B 后训练版，70.2 GB bf16）与
+Ornith-1.5-35B-A3B **架构完全一致**（40 层 / hidden 2048 / 256 专家 / moe_inter 512 /
+GatedDeltaNet 3-linear+1-full / 同 MTP 层），故 Ornith V4 配方零改动迁移（层号 36.22/37.15 通用）。
+
+**新增资产**：
+- `scripts/nex25_encode.py` — 自定义编码器强制 `reasoning_effort="none"`：该模板在缺省参数时会开一个
+  裸 `<think>` 块（`enable_thinking=False` 被模板忽略），思考痕迹会吃光 eval token。
+- `configs/nex25_mini_rocm_{smoke,sweep,sweep_direct,v1,v2_direct}.toml`、`run_nex25.sh`。
+- 关键：上游合并后 `resolve_model_class` 不再隐式识别 `qwen3_5_moe`，配置必须写 **`text_only = true`**
+  才能按纯文本 CausalLM 加载（该检查点带视觉塔）。
+
+**发现 1 — seed 的 `min_weight` 是比例不是绝对值**（`optimizer.py`：
+`min_frac = suggest_float(..., 0.0, frac_hi)` → `min_weight = min_frac * max_w`）。
+`configs/ornith15_35b_rocm_{v4,axlora,mpoa}.toml` 的 seed 写了 1.49 / 3.23 / 1.55 / 1.64（均 > 1），
+超出分布范围只 warn 不报错 → 实际 `min = max × 绝对值` → **剖面倒置**。
+实测同一 seed：bug 版 KL **8.31**，修正成比例后 KL **0.395**（差 20 倍）。
+（`-1bd` 已记过 axlora 的 12.5>5 倒置，但三份配置至今未修。）
+
+**发现 2 — EGA 只在 `steering_mode = "direct"` 下执行**（`steering.py`：`if steering_mode ==
+SteeringMode.DIRECT: … if engine.has_expert_routing(): _apply_ega_steering(...)`）。
+LoRA 模式下 PEFT 只能裹住 110 个真实 `nn.Linear`（shared_expert.down_proj×40 + 全注意力 q/k/v/o×40
++ linear_attn.out_proj×30）——**融合的 256 个专家（占权重 92%）完全没被碰过**。
+因此 `-1bf` 那轮号称「EGA across 256 experts」的 Ornith-1.5 V4 实验**实际从未运行 EGA**
+（该轮日志为 `LoRA adapters initialised (110 modules …)`，且全部 KL 0.7–2.4 被剪枝）。
+
+**A/B 实测（同一组 5 档强度、8 条 prompt、基线 8/8 全拒绝）**：
+
+| 档位 | o_proj | down_proj | LoRA KL / 拒绝 | **direct+EGA KL / 拒绝** |
+|---|---|---|---|---|
+| 1.0× | 3.23 | 9.19 | 0.395 / 0-8 | 0.584 / 0-8 |
+| 0.5× | 1.61 | 4.59 | 0.122 / 1-8 | 0.191 / **0-8** |
+| 0.25× | 0.81 | 2.30 | 0.034 / 6-8 | **0.052 / 0-8** ★ |
+| 0.1× | 0.32 | 0.92 | 0.007 / 8-8 | 0.011 / 3-8 |
+| 0.05× | 0.16 | 0.46 | 0.003 / 8-8 | 0.003 / 8-8 |
+
+结论：达成同样的「0/8 拒绝」，LoRA 需 KL 0.395，**direct+EGA 只需 0.052（约 7× KL 效率）**，
+与源码注释里 TrevorS 的「3/100 vs 29/100」一致。**MoE 消融应默认走 direct+EGA**；
+LoRA 模式在融合专家架构上等于自断 92% 权重。
+
+**执行**：`v1`（LoRA）在基线阶段中止；已按 direct 曲线重标定并启动
+`configs/nex25_mini_rocm_v2_direct.toml`（50 trials，o_proj [0.3,1.8] / down_proj [1.0,5.0]，
+5 个种子含 0.25× 冠军点与 down-heavy 形状）。
+
+**运维**：`ABLITERIX_UMA_MAX_SWAP_GB` 默认 0.5G 会在 70 GB mmap→CUDA 加载途中误报自杀
+（当时 RSS 仅 4.1 G、MemAvailable 62 G，内核回收冷匿名页）→ `run_nex25.sh` 已设 2 G；
+`min_free=18G` / `max_rss=96G` 保持不动。
 
 ---
 

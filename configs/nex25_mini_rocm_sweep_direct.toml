@@ -1,0 +1,249 @@
+# Nex-N2.5-mini — SENSITIVITY SWEEP, DIRECT MODE (EGA active).
+# A/B against nex25_mini_rocm_sweep.toml (LoRA): in direct mode mlp.down_proj is
+# handled by Expert-Granular Abliteration across all 256 fused experts, whereas
+# LoRA mode can only reach the shared expert (fused experts cannot be wrapped).
+#
+# Nex-N2.5-mini — SENSITIVITY SWEEP: 5 fixed strength scales of the (corrected)
+# Ornith V4 envelope, to map KL vs steering strength before the real search.
+# min_weight is a FRACTION of max_weight (see optimizer.py) — the Ornith V4 seed
+# wrote absolute values there, which inverted the profile (min > max) and blew KL up.
+#
+# Nex-N2.5-mini is a Nex-AGI post-trained Qwen3.5-35B-A3B derivative and is
+# ARCHITECTURALLY IDENTICAL to Ornith-1.5-35B-A3B (40 layers, hidden 2048,
+# 256 experts, moe_inter 512, GatedDeltaNet hybrid 3 linear + 1 full, BF16
+# 70.2 GB on disk). The V4 recipe below is therefore transferred verbatim from
+# Ornith-1.5, including its seed trials (same 40-layer indexing).
+#
+# Two model-specific points:
+#   * text_only = true  — the checkpoint is a VL wrapper (Qwen3_5Moe
+#     ForConditionalGeneration with a vision tower). Abliterix steers the
+#     language model only; upstream moved this from an implicit model_type
+#     check to this explicit switch.
+#   * custom encoder    — the bundled template opens a bare <think> block
+#     unless reasoning_effort is given; the encoder forces "none" so the
+#     model answers instead of burning the eval budget on a thinking trace.
+#
+# BF16 (quant_method = "none"): the experts are fused 3-D tensors
+# (mlp.experts.gate_up_proj / .down_proj, 64.4 GB = 92% of the checkpoint), so
+# bitsandbytes would leave them in full precision anyway.
+
+system_prompt = "You are a helpful assistant."
+
+[model]
+model_id = "/run/media/s117/OS/Models/Nex-N2.5-mini"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+trust_remote_code = true
+# VL wrapper checkpoint: steer the language model only.
+text_only = true
+# Force reasoning_effort="none" (empty thinking block) for eval stability.
+custom_encoder_module = "scripts/nex25_encode.py"
+custom_encoder_kwargs = {reasoning_effort = "none"}
+
+[inference]
+batch_size = 4
+min_batch_size = 1
+max_batch_size = 4
+skip_common_response_prefix = true
+min_gen_tokens = 8
+max_gen_tokens = 64
+
+[steering]
+steering_mode = "direct"
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "none"
+discriminative_layer_selection = false
+search_harmfulness_direction = false
+strength_range = [1.0, 10.0]
+disabled_components = []
+
+[steering.component_strength_ranges]
+"mlp.down_proj" = [2.0, 10.0]
+"attn.o_proj" = [1.0, 6.0]
+"attn.q_proj" = [0.5, 4.0]
+"attn.k_proj" = [0.5, 4.0]
+"attn.v_proj" = [0.5, 4.0]
+
+[experts]
+max_suppress = 0
+router_bias_range = [0.0, 0.0]
+ablation_weight_range = [0.0, 0.0]
+
+[optimization]
+num_trials = 5
+num_warmup_trials = 0
+sampler_seed = 117
+checkpoint_dir = "checkpoints_nex25_mini_sweep_direct"
+refusal_prescreen_enabled = false
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 8
+refusal_prescreen_prune_min = 19
+refusal_prescreen_seed = 117
+validation_kl_enabled = false
+validation_kl_size = 20
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+# Wide MPOA t39 envelope on o/down; QKV mid of their new ranges.
+[[optimization.seed_trials]]
+vector_scope = "per layer"
+vector_index = 36.22
+"attn.o_proj.max_weight" = 3.2300
+"attn.o_proj.max_weight_position" = 36.22
+"attn.o_proj.min_weight" = 0.4613
+"attn.o_proj.min_weight_distance" = 13.94
+"mlp.down_proj.max_weight" = 9.1900
+"mlp.down_proj.max_weight_position" = 37.15
+"mlp.down_proj.min_weight" = 0.3515
+"mlp.down_proj.min_weight_distance" = 12.53
+"attn.q_proj.max_weight" = 1.5000
+"attn.q_proj.max_weight_position" = 22.0
+"attn.q_proj.min_weight" = 0.3333
+"attn.q_proj.min_weight_distance" = 10.0
+"attn.k_proj.max_weight" = 1.5000
+"attn.k_proj.max_weight_position" = 22.0
+"attn.k_proj.min_weight" = 0.3333
+"attn.k_proj.min_weight_distance" = 10.0
+"attn.v_proj.max_weight" = 1.5000
+"attn.v_proj.max_weight_position" = 22.0
+"attn.v_proj.min_weight" = 0.3333
+"attn.v_proj.min_weight_distance" = 10.0
+
+[[optimization.seed_trials]]
+vector_scope = "per layer"
+vector_index = 36.22
+"attn.o_proj.max_weight" = 1.6150
+"attn.o_proj.max_weight_position" = 36.22
+"attn.o_proj.min_weight" = 0.4613
+"attn.o_proj.min_weight_distance" = 13.94
+"mlp.down_proj.max_weight" = 4.5950
+"mlp.down_proj.max_weight_position" = 37.15
+"mlp.down_proj.min_weight" = 0.3515
+"mlp.down_proj.min_weight_distance" = 12.53
+"attn.q_proj.max_weight" = 0.7500
+"attn.q_proj.max_weight_position" = 22.0
+"attn.q_proj.min_weight" = 0.3333
+"attn.q_proj.min_weight_distance" = 10.0
+"attn.k_proj.max_weight" = 0.7500
+"attn.k_proj.max_weight_position" = 22.0
+"attn.k_proj.min_weight" = 0.3333
+"attn.k_proj.min_weight_distance" = 10.0
+"attn.v_proj.max_weight" = 0.7500
+"attn.v_proj.max_weight_position" = 22.0
+"attn.v_proj.min_weight" = 0.3333
+"attn.v_proj.min_weight_distance" = 10.0
+
+[[optimization.seed_trials]]
+vector_scope = "per layer"
+vector_index = 36.22
+"attn.o_proj.max_weight" = 0.8075
+"attn.o_proj.max_weight_position" = 36.22
+"attn.o_proj.min_weight" = 0.4613
+"attn.o_proj.min_weight_distance" = 13.94
+"mlp.down_proj.max_weight" = 2.2975
+"mlp.down_proj.max_weight_position" = 37.15
+"mlp.down_proj.min_weight" = 0.3515
+"mlp.down_proj.min_weight_distance" = 12.53
+"attn.q_proj.max_weight" = 0.3750
+"attn.q_proj.max_weight_position" = 22.0
+"attn.q_proj.min_weight" = 0.3333
+"attn.q_proj.min_weight_distance" = 10.0
+"attn.k_proj.max_weight" = 0.3750
+"attn.k_proj.max_weight_position" = 22.0
+"attn.k_proj.min_weight" = 0.3333
+"attn.k_proj.min_weight_distance" = 10.0
+"attn.v_proj.max_weight" = 0.3750
+"attn.v_proj.max_weight_position" = 22.0
+"attn.v_proj.min_weight" = 0.3333
+"attn.v_proj.min_weight_distance" = 10.0
+
+[[optimization.seed_trials]]
+vector_scope = "per layer"
+vector_index = 36.22
+"attn.o_proj.max_weight" = 0.3230
+"attn.o_proj.max_weight_position" = 36.22
+"attn.o_proj.min_weight" = 0.4613
+"attn.o_proj.min_weight_distance" = 13.94
+"mlp.down_proj.max_weight" = 0.9190
+"mlp.down_proj.max_weight_position" = 37.15
+"mlp.down_proj.min_weight" = 0.3515
+"mlp.down_proj.min_weight_distance" = 12.53
+"attn.q_proj.max_weight" = 0.1500
+"attn.q_proj.max_weight_position" = 22.0
+"attn.q_proj.min_weight" = 0.3333
+"attn.q_proj.min_weight_distance" = 10.0
+"attn.k_proj.max_weight" = 0.1500
+"attn.k_proj.max_weight_position" = 22.0
+"attn.k_proj.min_weight" = 0.3333
+"attn.k_proj.min_weight_distance" = 10.0
+"attn.v_proj.max_weight" = 0.1500
+"attn.v_proj.max_weight_position" = 22.0
+"attn.v_proj.min_weight" = 0.3333
+"attn.v_proj.min_weight_distance" = 10.0
+
+[[optimization.seed_trials]]
+vector_scope = "per layer"
+vector_index = 36.22
+"attn.o_proj.max_weight" = 0.1615
+"attn.o_proj.max_weight_position" = 36.22
+"attn.o_proj.min_weight" = 0.4613
+"attn.o_proj.min_weight_distance" = 13.94
+"mlp.down_proj.max_weight" = 0.4595
+"mlp.down_proj.max_weight_position" = 37.15
+"mlp.down_proj.min_weight" = 0.3515
+"mlp.down_proj.min_weight_distance" = 12.53
+"attn.q_proj.max_weight" = 0.0750
+"attn.q_proj.max_weight_position" = 22.0
+"attn.q_proj.min_weight" = 0.3333
+"attn.q_proj.min_weight_distance" = 10.0
+"attn.k_proj.max_weight" = 0.0750
+"attn.k_proj.max_weight_position" = 22.0
+"attn.k_proj.min_weight" = 0.3333
+"attn.k_proj.min_weight_distance" = 10.0
+"attn.v_proj.max_weight" = 0.0750
+"attn.v_proj.max_weight_position" = 22.0
+"attn.v_proj.min_weight" = 0.3333
+"attn.v_proj.min_weight_distance" = 10.0
+
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01
+prune_threshold = 20.0
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = true
+
+[benign_prompts]
+dataset = "datasets/good_1000"
+split = "train[:8]"
+column = "prompt"
+
+[target_prompts]
+dataset = "datasets/harmful_1000"
+split = "train[:8]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "datasets/good_1000"
+split = "train[8:16]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "datasets/harmful_1000"
+split = "train[8:16]"
+column = "prompt"
