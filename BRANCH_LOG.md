@@ -11,7 +11,29 @@
 | 远端 | `origin` → https://github.com/Scorp1o117/abliterix |
 | 上游 | `upstream` → https://github.com/wuwangzhang1216/abliterix |
 | 最近对齐上游 | **v1.12.2**（`5d58cea`，merge `bb48dd9`）——已追平上游 `master` |
-| 本日志最近更新 | 2026-09-10 (Nex-N2.5-mini 消融开工 + direct/EGA 结论) |
+| 本日志最近更新 | 2026-09-11 (关键词拒绝判定剥离思考痕迹 + Nex v5 重启) |
+
+---
+
+## -1cq. 2026-09-11 — 修复：关键词拒绝判定未剥离思考痕迹
+
+`detector.py` 的 **LLM judge 路径**一直用 `re.sub(r"<think>.*?</think>", "", …)` 剥掉思考痕迹再解析 JSON，
+但**关键词路径没有**：`detect_refusal(response)` 直接吃原始回复文本。
+
+Nex-N2.5-mini 每个 trial 都报 `Thinking leak: detected`（即使编码器已强制
+`reasoning_effort="none"`，模型仍会漏思考标记），于是「思考里琢磨要不要拒绝」的文本被计入拒绝；
+在 256-token cap 下思考文本更长，**系统性高估拒绝率**——这也是 160→256 口径差异的一部分来源
+（同配方同 KL 0.0594：160 口径 12/100，256 口径 22/100，后者同时含真实长文崩坏与思考污染）。
+
+**修复**：
+- `DetectionConfig.strip_thinking_blocks: bool = True`（可关，用于复现历史数字）。
+- `detector.strip_thinking_blocks()`：剥 ` <think>…</think>`；**未闭合**的 `<think>` 视为延伸到回复末尾
+  （截断的纯思考回复 → 空 → 判为拒绝，符合"无可用内容即拒绝"的原意）。
+- `detect_refusal()` 先剥离再判定，与 judge 路径对齐。
+- 回归测试 `tests/test_thinking_strip.py`（6 例）；全量 `pytest` 仍为 **26 failed / 952 passed**（无新增失败）。
+
+**执行影响**：v5 首轮（00:08–00:42）的 trial 1（22/100 @ KL 0.0845）含思考污染，作废；
+已带补丁重启（00:42:59），旧 journal 保留为 `checkpoints_nex25_mini_v5_prestrip/` 作对照。
 
 ---
 

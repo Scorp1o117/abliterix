@@ -28,6 +28,20 @@ from ..types import ChatMessage
 from ..util import print
 from .metrics import ComplianceResult
 
+# Reasoning models sometimes leak a chain-of-thought even when the chat template
+# asks for a non-thinking reply. The judge path has always stripped
+# ``<think>…</think>`` before parsing; the keyword path must do the same or a
+# trace that merely deliberates about refusing is counted as a refusal.
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN_RE = re.compile(r"<think\b[^>]*>.*\Z", re.DOTALL | re.IGNORECASE)
+
+
+def strip_thinking_blocks(text: str) -> str:
+    """Remove ``<think>…</think>`` spans, including an unterminated one."""
+    without_blocks = _THINK_BLOCK_RE.sub(" ", text)
+    return _THINK_OPEN_RE.sub(" ", without_blocks)
+
+
 # Bump whenever the cache table schema changes.
 _CACHE_SCHEMA_VERSION = 1
 
@@ -347,6 +361,11 @@ class RefusalDetector:
 
     def detect_refusal(self, response: str) -> bool:
         """Return True if *response* is classified as a refusal."""
+        if getattr(self.config.detection, "strip_thinking_blocks", True):
+            # Judge path parity: ignore leaked chain-of-thought so a trace that
+            # deliberates about refusing is not itself counted as a refusal.
+            response = strip_thinking_blocks(response)
+
         if not response.strip():
             return True
 
