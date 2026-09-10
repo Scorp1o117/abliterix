@@ -11,7 +11,28 @@
 | 远端 | `origin` → https://github.com/Scorp1o117/abliterix |
 | 上游 | `upstream` → https://github.com/wuwangzhang1216/abliterix |
 | 最近对齐上游 | **v1.12.2**（`5d58cea`，merge `bb48dd9`）——已追平上游 `master` |
-| 本日志最近更新 | 2026-09-11 (关键词拒绝判定剥离思考痕迹 + Nex v5 重启) |
+| 本日志最近更新 | 2026-09-11 (TOML 根级键坑 + 阶段一烘烤工具链) |
+
+---
+
+## -1cr. 2026-09-11 — 坑：TOML 根级键写在 `[section]` 之后会被静默吞掉
+
+生成 `configs/nex25_bake.toml` 时把 `non_interactive_output_dir` 插在 `[display]` 段之后，
+导出**静默不发生**：按 TOML 规则，段头之后的所有裸键都属于该表，于是它变成了
+`display.non_interactive_output_dir`（未知字段被 pydantic 忽略）。
+
+复核主人的模板：`ornith15_*` / `spark_x25_*` / `qwen38_*` 等配置里的
+`non_interactive = true` **同样写在 `[display]` 之后** → 一直是靠 runner 的
+`--non-interactive` CLI 参数生效，配置文件里的那一行从未起作用。
+凡是根级字段（`non_interactive`、`non_interactive_output_dir`、`overwrite_checkpoint`、
+`system_prompt` 等）都必须写在**第一个段头之前**。
+
+`scripts/nex25_bake.py` 已改为把批量导出键插到文件顶部，并加注释说明原因。
+
+**另一个 CLI 行为**：对已标记 `finished` 的 study，非交互模式会直接拒绝
+（`checkpoint already finished and overwrite_checkpoint=false`）→ 想复用已完成的 journal
+只做导出是行不通的，必须 `--overwrite-checkpoint`（会重跑那一个 trial，顺带复验数字）
+或自己走 scriptlib 导出。本次选择前者：21/100 @ KL 0.0845 复现完全一致。
 
 ---
 

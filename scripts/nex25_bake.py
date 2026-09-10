@@ -98,10 +98,17 @@ def main() -> None:
         f'checkpoint_dir = "{Path(args.checkpoint_dir).name}"',
         f'checkpoint_dir = "{args.bake_checkpoints}"',
     )
-    src = src.replace(
-        "non_interactive = true",
-        f'non_interactive = true\nnon_interactive_output_dir = "{args.out}"',
+    # TOML gotcha: a bare key after a [section] header belongs to that section,
+    # so root-level batch keys must be inserted before the first section header
+    # (the stock templates put non_interactive near [display], where it is
+    # silently swallowed as display.non_interactive).
+    src = src.replace("\nnon_interactive = true\n", "\n")
+    batch_keys = (
+        "non_interactive = true\n"
+        f'non_interactive_output_dir = "{args.out}"\n\n'
     )
+    first_section = src.index("\n[")
+    src = src[: first_section + 1] + batch_keys + src[first_section + 1 :]
 
     # --- replace every seed block with the chosen trial ------------------
     start = src.index("[[optimization.seed_trials]]")
