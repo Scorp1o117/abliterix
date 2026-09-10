@@ -11,7 +11,851 @@
 | 远端 | `origin` → https://github.com/Scorp1o117/abliterix |
 | 上游 | `upstream` → https://github.com/wuwangzhang1216/abliterix |
 | 最近对齐上游 | **v1.12.1**（`76a7a31`，merge `09c6e53`）；上游 `master` 已前进到 `05c3e87`，尚未再 merge |
-| 本日志最近更新 | 2026-08-13 (commit Ling campaign library + frozen deliverables) |
+| 本日志最近更新 | 2026-09-06 (Spark-X2.5-1.7B V1–V4 搜索 + V30 T615 bake) |
+
+---
+
+## -1cn. 2026-09-05/06 — Spark-X2.5-4B V30 T615 bake + Spark-X2.5-1.7B V1–V4 搜索
+
+> 本节为 2026-09-10 同步上游时**补记**（当日产物落盘但未入日志）。两部分：
+> (a) 09-05/06 的日志缺口；(b) 此前只存在于工作区的实验产物（configs/scripts/runners，
+> 最早 2026-08-05）随本次同步一并入库。事实取自脚本/配置内自述，不作运行结论推断。
+
+**Spark-X2.5-4B（V30 家族收尾）**
+- `export_spark_x25_t615.py`：T615（**7/100 @ 3-token KL 0.1468**）取代 T580，作为
+  `Models/Spark-X2.5-4B-abliterated` 的 bake 目标（用户指定替换）。
+- `export_spark_x25_t580.py`：按用户要求导出 T580（20/100 @ 3-token KL 0.0924）——
+  明确的非 dual HIT 导出。
+- `eval_spark_x25_v30_t579_t580_merge.py`：T579+T580 合并评测，dual HIT 才 bake。
+- `sweep_spark_x25_t580_leftover.py`：在 T580 仍拒绝的 prompt 上估第二条 mean 方向，
+  再对合并后的 T580 权重做 LoRA-peel。
+- `eval_spark_x25_ara_t49_t196.py`：T49/T196 全权重 ARA，用 Abliterix 原生 LBFGS 在
+  `self_attn.out_proj + mlp.down_proj` 上按 Heretic Optuna 超参重拟合。
+- `inspect_spark_x25_t580_refusals.py` / `inspect_spark_x25_t580_r18.py`：拒绝样本排查。
+
+**Spark-X2.5-1.7B（新模型线：28 层 / hidden 2048 / intermediate 6656，
+fused `q_k_v_proj` + `out_proj`，3 sliding + 1 full）**
+- V1：不播种的首轮 mergeable mean-LoRA 搜索（同 4B 家族，但层数/宽度不同，4B 种子不通用）。
+- V2：用 4B V30 champion 播种，层号/索引按 27/35 缩放（last_layer 35→27）。实测 4B 全局
+  种子（qkv≈3.1–3.6）在 1.7B 上过度拒答/KL 爆炸，把 TPE 拉向封闭墙。
+- V3：改为 1.7B 原生 Pareto 播种。
+- V4：放宽搜索箱 `o_proj [auto-off, 12]`、`qkv [auto-off, 8]`、`down [auto-off, 2.5]`，
+  KL 剪枝 0.6；wrapper 每轮 +400 trials 直到 dual HIT（refusals ≤10 且 3-token KL ≤0.1），
+  **不 bake**。
+- Runner：`run_spark_x25_1p7b.sh`、`run_spark_x25_1p7b_v4_keep.sh`、
+  `run_spark_x25_1p7b_heretic_then_ara.sh`（经典 Heretic 30 → 全权重 ARA 200，顺序占 GPU）、
+  `run_spark_x25_leftover_then_ara.sh`。
+
+**随本次入库的存量产物**：`configs/spark_x25_4b_lora_v30.toml`、`configs/lfm25_2.6b.toml`、
+`configs/muse_glimmer_30b_rocm*.toml`(8)、`configs/ornith15_35b_rocm_*.toml`、
+`configs/qwen38_27b_rocm*.toml` 及配套 `scripts/sweep_qwen38_*.py`、
+`bake_qwen38_cga_distill.py`、`apply_qwen38_ara_fixed.py`、`run_qwen38*.sh`、
+`run_ornith15.sh`、`run_muse_glimmer.sh`、`requirements-qwen4exp.txt`。
+
+---
+
+## -1cm. 2026-09-04 — Spark V30 hard mean-LoRA Optuna (full-100 scoring)
+
+Heretic 2.0 and T9 adapter missed dual bar (87/100 @ 3-token KL 0.1086).
+No remaining distinct mergeable recipe. Hard-search the V9 family: rank-8
+full-norm mean LoRA, projected on, o_proj [2.0, 8.0], 100 trials / 24
+warmup, seed T32+T31. Prescreen only prunes 25+/30 so borderline points
+get a real 100-eval (V9 T32 was a 18/30 estimate). Ship bar updated to
+refusals ≤10/100 and 3-token KL ≤0.10. Paused 2026-09-04 17:27 after
+24 completed trials (T25 mid-eval), then resumed. After the first 100
+complete, raise budget without overwrite. Do not stop on a near-miss
+(≤12 and KL ≤0.12). On dual HIT (≤10 and KL ≤0.10), judge whether KL
+0.05 is still reachable; if yes, keep searching. Bake merged only when
+≤10 and KL ≤0.05, or when ≤10 and KL ≤0.10 and 0.05 looks unreachable.
+`num_trials = 800` after 500 if still no dual HIT.
+
+## -1cl. 2026-09-04 — Heretic 2.0 T9 adapter on Abliterix 3-token meter
+
+Official Heretic 2.0.0.dev0 30-trial search missed dual bar on its own
+first-token KL (best T9 43/100 @ 0.1655). Score that saved LoRA adapter
+with Abliterix keyword + 3-token KL vs V9 original baseline. Bake merged
+only on dual HIT. `scripts/eval_spark_x25_heretic_adapter.py`.
+
+## -1ck. 2026-09-04 — Spark-X2.5-4B full-weight ARA (mergeable)
+
+CGA/distill abandoned for this goal (ungateable). Spark never ran ARA.
+One-shot full-weight ARA, not ARA-LoRA: trohrbaugh knobs, o_proj+down_proj,
+layers 8–32 of 36, BF16 LBFGS, score keyword + 3-token KL vs V9 original
+baseline. Bake merged only on dual HIT. `scripts/apply_spark_x25_ara_fixed.py`.
+Finished ~13 min: **5/100 @ KL 0.3038**, HIT=false. Refusal opens, KL
+worse than Householder o=2.9 (9@0.182). Delta
+`exports/spark_x25_ara_fixed_delta.pt` (1.7G). No bake.
+
+## -1cj. 2026-09-02 — Spark CGA distill of V27 12@0.047 into merged LoRA
+
+V29 qkv on decoder_block was a no-op (still 12 @ 0.0474). Distill the
+runtime CGA teacher (filter keyword refusals) into mergeable LoRA r=8
+and re-eval the merged dir vs original.
+`scripts/bake_spark_x25_cga_distill.py`.
+
+## -1ci. 2026-09-02 — Spark CGA V29 qkv on the 12@0.047 plateau
+
+Leftovers are compliance-theater / "I can't" (8 early, 4 late), not
+Sorry-prefix. Prefix retry and lower thresh did not move them. Add
+all-layer qkv beside o=1.35 (0.0026 KL budget).
+`scripts/sweep_spark_x25_cga_v29.py`.
+
+## -1ch. 2026-09-02 — Spark CGA leftover inspect at 12@0.047
+
+V28 prefix-retry and t=0.45/0.40 left refusals at 12. The last 12 are
+gated but not flipped. Dump their prefixes.
+`scripts/inspect_spark_x25_cga_leftover.py`.
+
+## -1cg. 2026-09-02 — Spark CGA V28 leftover-prefix retry on 12@0.047
+
+V27 plateau: all-layer global t0.50 s1.35 d40 → 12/100 @ KL 0.0474;
+s1.40 went to 13 @ 0.0502. Last 12 are first-token leftovers. V28
+bans refusal-prefix tokens on gate-on retry and lowers threshold.
+`scripts/sweep_spark_x25_cga_v28.py`.
+
+## -1cf. 2026-09-02 — Spark CGA V27 all-layer interpolate around 17@0.039
+
+V26 new best under 0.05: global all-layer t0.50 s1.20 d40 → 17/100 @
+KL 0.0392 (T32 was 57 @ 0.0456). s1.00 d40 was 37 @ 0.0302. V27
+interpolates s=1.22–1.40 plus linear_projection and L18/L30.
+`scripts/sweep_spark_x25_cga_v27.py`.
+
+## -1ce. 2026-09-02 — Spark CGA V26 dense global_prompt pocket
+
+V25 broke the mean/HH Pareto: global_prompt t0.50 s1.00 → 53/100 @
+KL 0.0242 (T32 was 57 @ 0.0456); t0.30 s1.40 → 24/100 @ 0.0647 (HH
+o=2.3 was 25 @ 0.123). V26 spends the 0.024→0.05 KL budget plus
+both-sign / linear_projection / all-layer / last-layer variants.
+`scripts/sweep_spark_x25_cga_v26.py`.
+
+## -1cd. 2026-09-02 — Spark concept-gated angular on V9 mean-diff
+
+SOM 2×2 killed after 14 trials: 17/30 ~57est @ KL 0.1385 (mean T32 was
+0.0456), 2/30 @ 0.82. Next distinct recipe: CGA runtime gate so benign
+3-token KL can stay low while harmful tokens rotate. Dual HIT is
+runtime-only — distill before bake. `scripts/sweep_spark_x25_cga.py`.
+
+## -1cc. 2026-09-02 — Spark SOM 2×2 correlated-direction LoRA
+
+HH-rpair killed after 5 points: 99/100 @ KL 0.0438, 91/100 @ 0.101,
+75/100 @ 0.1335 — worse than mean HH (9/100 @ 0.182). Next distinct
+recipe: Kohonen SOM 2×2 (4 correlated dirs, not SVD n_dir=3). Mergeable
+full-norm LoRA rank 8, prune 0.12. `configs/spark_x25_4b_som_v24.toml`.
+
+## -1cb. 2026-09-02 — Spark Householder on Sorry-vs-Sure vectors
+
+V23 response-pair LoRA: T4 8/30 @ KL 0.308, T6 9/30 @ 0.239 — opens but
+worse KL than mean HH (9/100 @ 0.182). V24: Householder isometric peel
+of the cached V23 vectors. `scripts/sweep_spark_x25_hh_rpair.py`.
+
+## -1ca. 2026-09-02 — Spark V23 response-pair Sorry vs Sure LoRA
+
+V22 system-prompt pairing: 16 trials all 29–30/30 prune (T32 geometry
+cannot open). V23 teacher-forces "I'm sorry, but I can't..." vs
+"Sure, I can help..." on the same harmful prompts. Eval unchanged.
+`configs/spark_x25_4b_rpair_v23.toml`.
+
+## -1bz. 2026-09-02 — Spark V22 same-prompt conditional refusal LoRA
+
+V21 OT: T32-like geometry 60est @ KL 0.127 (worse than mean T32 0.046).
+Killed. V22: identical harmful_1000 prompts, compliance vs refuse system
+prompts; eval unchanged. Isolates refusal prefix, not topic.
+`configs/spark_x25_4b_paired_v22.toml`.
+
+## -1by. 2026-09-02 — Spark V21 optimal-transport LoRA
+
+V20 COSMIC: 11 trials all 28–30/30 prune. V21 OT LoRA rank-3, V9
+envelope, prune 0.12. `configs/spark_x25_4b_lora_v21.toml`.
+
+## -1bx. 2026-09-02 — Spark V20 COSMIC residual LoRA
+
+V19 PCA: 10 trials all 29–30/30 prune. V20 COSMIC LoRA rank-3, o_proj
+[3.0, 7.5], prune 0.12, 30 trials. `configs/spark_x25_4b_lora_v20.toml`.
+
+## -1bw. 2026-09-02 — Spark V19 PCA residual LoRA
+
+Unlikelihood from original: 8 steps 98/100 @ KL 0.273, cap trip.
+V19 PCA LoRA rank-3, V9 envelope, prune 0.12, 30 trials.
+`configs/spark_x25_4b_lora_v19.toml`.
+
+## -1bv. 2026-09-02 — Spark unlikelihood LoRA on T32 leftover prefixes
+
+First-token leftover-opened LoRA: 46/100 @ 0.154, not dual HIT. Next:
+unlikelihood on leftover's own refusal prefixes after T32, KL cap 0.049
+vs original. `scripts/train_spark_x25_unlikelihood.py`.
+
+## -1bu. 2026-09-02 — Spark first-token leftover-vs-opened LoRA peel
+
+Prefill leftover-vs-opened cos=0.16 (new dir) but HH o=0.4 already KL
+0.085 at 55/100. Remaining refusals are first-token "I'm sorry". Extract
+teacher-forced first-12-char residuals leftover vs opened, LoRA peel on
+merged T32. `scripts/sweep_spark_x25_first_token.py`.
+
+## -1bt. 2026-09-02 — Spark leftover-vs-opened contrast peel
+
+V18 linear decay same Pareto (T15 60/100 @ 0.0434). Next: T32 leftovers
+vs already-opened harmful prompts (not vs benign), Householder peel of
+that contrast on merged T32.
+`scripts/sweep_spark_x25_opened_contrast.py`.
+
+## -1bs. 2026-09-02 — Spark V18 linear-decay mean LoRA
+
+V17 median killed: T6 11/30 @ KL 0.190 at T32-like geometry (mean T32 was
+57/100 @ 0.0456). V18 linear decay, rank-3, prune 0.12, 30 trials.
+`configs/spark_x25_4b_lora_v18.toml`.
+
+## -1br. 2026-09-02 — Spark V17 median residual LoRA
+
+T32 leftover inspect: 57/100 refuse, 53 early in first 80 chars, only 4
+late-only. 3-token KL is the real bottleneck. V17 median-of-means LoRA
+rank-3, V9 envelope, prune 0.12, 30 trials.
+`configs/spark_x25_4b_lora_v17.toml`.
+
+## -1bq. 2026-09-02 — Spark T32 leftover prefix inspect
+
+V16 T4/T6: 8/30 @ KL 0.19–0.22, same Pareto as V1. Inspect T32's 57
+leftover eval prefixes: if refusals start in the first 80 chars, 3-token
+KL must move; late-only refusals would justify a later-token peel.
+`scripts/inspect_spark_x25_t32_leftover.py`.
+
+## -1bp. 2026-09-02 — Spark V16 LoRA weight_normalization=none
+
+V15 killed after 21: 7/30 @ KL 0.14, no KL≤0.05 opening. V16 rank-1
+unnormalized LoRA, o_proj [1,8], prune 0.12, 30 trials.
+`configs/spark_x25_4b_lora_v16.toml`.
+
+## -1bo. 2026-09-02 — Spark V15 mean LoRA, projected_abliteration=false
+
+Narrow HH dist=4/6/8 never opened (best 81/100 @ 0.0498). Refusal lives
+in a wide layer band, which is the KL cost. V15: V9 envelope, rank-3,
+projected_abliteration=false, prune 0.12, 40 trials.
+`configs/spark_x25_4b_lora_v15.toml`.
+
+## -1bn. 2026-09-02 — Spark Householder narrow layer band
+
+HH leftover 2nd reflection undid stage-1 (79→100). r2_orth did not
+drop refusals (76–82) while KL rose to 0.20. Next: HH o=1.5–4.0 with
+min_weight_distance 4/6/8 (late layers only).
+
+## -1bm. 2026-09-02 — Spark HH o=1 leftover second reflection
+
+Dense HH: KL≤0.05 best 63/100 @ 0.046 (o=1.35); refusals≤10 at o=2.9
+9/100 @ 0.182. Stage-1 HH o=1.0 is 79/100 @ 0.0285 (0.0215 KL left).
+V14 `scripts/sweep_spark_x25_hh_leftover.py` composes a second
+Householder on leftover r2 / r2_orth.
+
+## -1bl. 2026-09-02 — Spark Householder dense o_proj grid
+
+Coarse HH: 79@0.0285 (o=1), 35@0.094 (o=2), 11@0.192 (o=3), 6@0.271
+(o=4), 1@0.353 (o=5.5). qkv HH collapsed. Dense o-only 1.15–1.85
+(KL≤0.05 band) and 2.3–3.2 (refusals≤10 band).
+
+## -1bk. 2026-09-02 — Spark Householder isometric peel
+
+V12 leftover r2_neg restored refusals (76–99/100). r2_orth: 40/100 @
+KL 0.197 — same Pareto as V5, not cheaper. Next: Householder direct on
+original mean-diff (`scripts/sweep_spark_x25_householder.py`), mergeable
+norm-preserving reflection, o_proj 1–8.5.
+
+## -1bj. 2026-09-02 — Spark T32 leftover r2 flip + orthogonal
+
+V11 leftover peel undid T32: 57/100 @ 0.0456 → 74/88/90/95 as o rose
+0.6→1.8, KL drifted down toward original. cos(r1,r2)=0.78. Killed.
+V12 `scripts/sweep_spark_x25_t32_r2flip.py`: r2_neg=-r2 and
+r2_orth=r2-proj_r1, LoRA peel on merged T32, KL vs original.
+
+## -1bi. 2026-09-02 — Spark-X2.5-4B V9 T32 leftover peel
+
+V10 n_directions=3 mean LoRA (50 trials) killed after 18: leftover
+openings only at KL 0.40–0.50 (T5 6/30 @ 0.495). Same original residual
+subspace, worse Pareto than V9. Next: apply V9 T32 (18/30 est 60/100 @
+KL 0.0456), extract mean-diff on leftover keyword-refusals, LoRA-peel r2
+on merged T32, score 3-token KL vs original baseline. Script
+`scripts/sweep_spark_x25_t32_leftover.py`. HIT still refusals≤10/100 and
+KL≤0.05 vs original; bake to `/run/media/s117/OS/Models/Spark-X2.5-4B-abliterix`.
+
+## -1bh. 2026-08-22 — Ornith-1.5 switched to Heretic 1.4 classic
+
+Abliterix MPOA/LoRA/V4 all-pruned. Running Heretic 1.4.0 from
+`heretic-ara-lora` like Ornith-1.0 Trial 63: `row_normalization=full`
+rank-3, o_proj+down, no ARA, BF16. Config
+`config.ornith15-classic.toml`, study `checkpoints-ornith15-classic`,
+datasets heretic-data alpaca / harmful_behaviors.
+
+## -1bg. 2026-08-22 — Ornith-1.5 V4 datasets → Abliterix good/harmful_1000
+
+Stopped alpaca/harmful_behaviors (Heretic 1.0). All ornith15 configs
+now `datasets/good_1000` + `datasets/harmful_1000` (`prompt` column,
+train[:800] / [800:900]). New study `checkpoints_ornith15_35b_v4_axds`.
+
+## -1bf. 2026-08-22 — Ornith-1.5 V4: enable QKV + EGA down_proj
+
+axlora (QKV off) still ~all-prune; one score ~30@0.147. Switch to
+sister 35B-A3B V4: `disabled_components=[]`, o_proj [1,6], q/k/v
+[0.5,4], down [2,10] (EGA across 256 experts). Study
+`checkpoints_ornith15_35b_v4`.
+
+## -1be. 2026-08-22 — Ornith-1.5 Abliterix default LoRA TPE
+
+MPOA (1.0 recipe) plateaued at 30@0.078. New study
+`checkpoints_ornith15_35b_axlora`: `weight_normalization=none`
+rank-1 LoRA, o_proj [1,8] down [0,10], seeds t39/t10 envelopes.
+BF16 batch 128. Config `configs/ornith15_35b_rocm_axlora.toml`.
+
+## -1bd. 2026-08-22 — Ornith-1.5 wide 60-trial finished
+
+20 scored / 40 pruned. Best KL-efficient: **t39 30/100 @ 0.078**
+(o_max=3.23 down_max=9.19, per-layer). t46 30@0.079; t53 33@0.091;
+t47 37@0.056; t37 29@0.150. No 8–12. Strong seed min_weight was
+scaled to 12.5>max 5 (envelope inverted, 30/30 prune).
+
+## -1bc. 2026-08-21 — Ornith-1.5 widen strength after all-prune
+
+v1 [0.5, 2.1] pruned 28 trials at 28–30/30. New study
+`checkpoints_ornith15_35b_wide`: o_proj [1, 8], down [1, 10],
+batch 128 BF16, plus a stronger MoE seed (o=5 / down=6).
+
+## -1bb. 2026-08-21 — Ornith-1.5-35B-A3B Trial-63 MPOA (BF16)
+
+Same recipe as Ornith-1.0 t62/t63: `weight_normalization=full`
+rank-3, o_proj+down only, no routed-expert ablation. BF16 no bnb.
+MTP already in the 16 shards. Config
+`configs/ornith15_35b_rocm_mpoa.toml`, `./run_ornith15.sh`.
+Checkpoint `checkpoints_ornith15_35b`. Batch 32 for UMA headroom.
+
+## -1ba. 2026-08-21 — Removed repo `checkpoints_qwen38_27b_*`
+
+Deleted pocket/rdo/iter/cga/judge/v2–v8/etc. (~44G). Home disk
+6.9G → 51G free. Original model on OS volume unchanged.
+
+## -1az. 2026-08-21 — Removed derived Qwen3.8-27B checkpoints
+
+Deleted all `/run/media/s117/OS/Models/Qwen3.8-27B-*` (t24, FP8,
+distill, DPO LoRA, heretic-ara, ssm-repaired, etc.). Kept original
+`/run/media/s117/OS/Models/Qwen3.8-27B` (52G). Repo Optuna
+checkpoints untouched.
+
+## -1ay. 2026-08-21 — Huihui 32-pair + skip-early-layers miss
+
+32+32 house train, r at layer 38, skip layers 0–14 (and 56–63 /
+32–39). Skip0-15 s1.00: **96@0.220**; skip 32–39 too: **100@0.148**.
+Layer skip matches our bands, but 32 random pairs give a weak r vs
+800-pair ORBA. Not in 8–12 @ ≤0.1.
+
+## -1ax. 2026-08-21 — CGA linmap bake miss (CPU rank-4)
+
+Fit rank-4 A on layers 24–56 from CGA vs orig residuals (benign
+target 0). `W'=(I+sAᵀ)W`. s0.50 90@0.258; s1.00 **68@1.05**;
+s1.30 83@1.87. Skip/非线性门控写不进低秩 W。Desktop-safe CPU fit
+OK. Best mergeable still ORBA o8.7 20@0.125 / o12.2 12@0.210.
+
+## -1aw. 2026-08-21 — ORBA t24-band hits 8–12 refusals, KL ~0.21
+
+In-memory only (no 52G write). o12.2 **12@0.210**, o12.8 **9@0.229**,
+o13.2 **10@0.239**. Still KL>0.1. Best KL-efficient remains o8.7
+**20@0.125**. Closest in-band: o12.2 12@0.210.
+
+## -1av. 2026-08-20 — OrcaRouter Arditi recipe on our meter
+
+Layer-38 massive-masked `r`, `W' = W − s r(rᵀW)` on 129 residual
+writers + embed. Our keyword + 3-token vs original:
+s1.00 **72@0.105**, s1.10 49@0.153, s1.25 16@0.279, s1.50 4@0.567.
+Mergeable, but 8–12 sits around s≈1.22 with KL ≫ 0.1. t24 50@0.087
+still more KL-efficient.
+
+## -1au. 2026-08-20 — DPO/SFT still miss 8–12 @ KL≤0.1 mergeable
+
+retain2 late-LoRA: 100@0.0008–0.0054; ×6 scale 94@2.31 (collapse).
+DPO CGA-chosen vs original-rejected: 100@0.0015 → 100@0.027 → 100@0.111
+→ **96@0.241** then stop. No merge. Loadable checkpoint remains
+`Qwen3.8-27B-t24` 50/100 @ 0.0869.
+
+## -1at. 2026-08-20 — Mix/peel/residual miss; householder next
+
+Biprojected 30@0.116 / 24@0.150. ORBA 31@0.110 / 21@0.131. Original
+mean-diff ORBA on t24 undoes it (90–100 refusals). Residual re-extract
+on t24: 52–61 @ 0.082–0.087, no extra refusal drop. Still no 8–12 @
+KL≤0.1 mergeable. Householder t24-band 0.35/0.70/1.00 next.
+
+## -1as. 2026-08-20 — t24 merged eval 50@0.0869; FP8 written
+
+Checkpoint `/run/media/s117/OS/Models/Qwen3.8-27B-t24` (ordinary
+qwen3_5 shards). `eval_qwen38_vs_original.py --merged`: **50/100 @
+0.0869** vs original (matches search). KL ≤0.1, refusals not 8–12.
+FP8: `/run/media/s117/OS/Models/Qwen3.8-27B-t24-fp8` via
+`scripts/quantize_fp8.py` (linear_attn weight_scale_inv MISSING on
+BF16 source — transformers report).
+
+## -1ar. 2026-08-20 — Retain v2 100@4.16; ORBA 34@0.101; bake t24
+
+Retain SFT 100/100 @ 4.16. ORBA t24-band: 60@0.070 / **34@0.101**. No
+8–12 @ ≤0.1 on mergeable weights. Baking pocket trial 24 LoRA to
+`/run/media/s117/OS/Models/Qwen3.8-27B-t24` (search 50@0.087) as the
+loadable/quantizable checkpoint.
+
+## -1aq. 2026-08-20 — Distill v1 collapse 94@3.25; retain SFT v2
+
+Merged `/run/media/s117/OS/Models/Qwen3.8-27B-cga-distill` via
+`eval_qwen38_vs_original.py --merged`: **94/100 @ KL 3.2491** (broken).
+Adapter lerp 0.05–0.50 stays 100/100 @ 0.0006–0.0705. Next: short-prefix
++ benign-repeat SFT (`scripts/bake_qwen38_cga_retain.py`), in-memory
+score before another 52G write.
+
+## -1ap. 2026-08-20 — Distill CGA sidecar into mergeable LoRA
+
+Runtime CGA cannot be algebraically merged. Added
+`src/abliterix/distill.py` (continuation labels + SFT loss) and
+`scripts/bake_qwen38_cga_distill.py`: teacher-generate on train
+harmful/benign with the 11@0.041 sidecar, LoRA-SFT the original,
+write adapter + merged BF16 under `/run/media/s117/OS/Models/`.
+Home disk is too small for a 52G merge.
+
+## -1ao. 2026-08-20 — Named candidate 11/100 @ 0.0413
+
+**Candidate:** `cga_low_global_prompt_t0.35_1.60`
+(`artifacts/qwen38_cga_global_t035_s160.json`). Runtime
+concept-gated angular on original Qwen3.8-27B: pocket mean-diff
+vectors, 64-layer decoder_block hooks, `global_prompt` latch at
+layer 32, threshold 0.35, strength 1.60 (overrotation). Keyword
+**11/100** on harmful_1000 `train[900:]`, 3-token
+`full_distribution_kl` **0.0413** vs original (pocket baseline).
+Capture: `logs/qwen38_cga_low_sweep.json` (named_candidate set).
+Not mergeable; load via the artifact + scorers/vectors paths.
+
+## -1an. 2026-08-19 — CGA global 20@0.040; densify threshold
+
+`scripts/sweep_qwen38_cga_all.py`: token-scope 55–67 @ 0.18–0.23
+(worse than LoRA). Prompt-latch 75–81 @ 0.001–0.004 (benign-safe but
+weak). **global_prompt t0.35 strength 1.0: 20/100 @ 0.040** — best
+KL-at-refusal so far, 0.06 KL still in budget. Next:
+`scripts/sweep_qwen38_cga_low.py` global 0.15–0.32 plus overrotation
+1.3/1.6 at 0.35.
+
+## -1am. 2026-08-19 — Narrow CGA gate-dead; all-layer lower threshold
+
+`scripts/sweep_qwen38_cga.py`: adaptive 53@0.122 / 47@0.175 (same
+Pareto). Prompt-latch on t24/wide12 band at 0.5–0.7: 91–98/100 @
+KL 0.000 — scorers exist 64/64 but late-layer last-token never
+crosses threshold. Crashed on `global_prompt` (`decision_layer=-1`).
+Next: `scripts/sweep_qwen38_cga_all.py` all 64 decoder hooks, token/
+prompt/global scopes, thresholds 0.20–0.50, strength 1.0.
+
+## -1al. 2026-08-19 — Narrow-band angular same Pareto; concept-gate next
+
+`scripts/sweep_qwen38_md_angular.py`: t24-band (10 layers) 85@0.072 /
+59@0.106 / 51@0.121; wide-12 58@0.135 / 42@0.164; linear t24-band
+80@0.084 / 55@0.119; weak flat 94@0.092 / 80@0.162. No 8–12 @ KL≤0.1.
+LoRA t24 (50@0.087) still dominates this direction. Next:
+`scripts/sweep_qwen38_cga.py` — adaptive angular then concept-gated
+angular (prompt/global latch) so benign 3-token KL can stay low.
+
+## -1ak. 2026-08-19 — Residual hooks miss; narrow-band mean-diff angular
+
+`scripts/sweep_qwen38_rdo_hooks.py` finished, no 8–12 @ KL≤0.1.
+RDO residual (paper linear + angular, all 64 layers): **99/100** @
+0.0036–0.0085 — learned r does not transfer. Pocket mean-diff angular
+flat all-layer: 23@0.327, 18@0.399, 13@0.436, **9@0.457**. Refusal
+target appears only far past the KL gate (worse than LoRA 10@0.26).
+Next: `scripts/sweep_qwen38_md_angular.py` uses the t24 envelope
+(peak 49.6, distance 5.1) plus a wider-12 band, linear projection in
+that band, and weak flat 0.08/0.14.
+
+## -1aj. 2026-08-19 — RDO-direct miss; residual-stream hooks next
+
+`scripts/sweep_qwen38_rdo_direct.py` finished: o0.30–o3.00 all **100/100**
+at 3-token KL 0.0007–0.0063 vs original. o_proj-only direct is not the
+RDO paper apply (`h ← h − (h·r̂)r̂` on every decoder block). Next:
+`scripts/sweep_qwen38_rdo_hooks.py` installs linear_projection then
+angular residual hooks on cached RDO vectors, then pocket mean-diff
+angular if RDO still misses. Keyword + 3-token vs original; JSON to
+`logs/qwen38_rdo_hooks_sweep.json`.
+
+## -1ai. 2026-08-19 — RDO+LoRA 10-trial all pruned; sweep RDO as direct
+
+RDO 40-step AdamW finished (L 17.5→3.36). Learned r is nearly orthogonal
+to pocket mean-diff (global cos 0.109). All 10 LoRA trials at o∈[3.8,6]
+prescreen-pruned high (22–30/30). Next: apply cached RDO vectors as
+flat all-layer `steering_mode=direct` (`scripts/sweep_qwen38_rdo_direct.py`).
+
+## -1ah. 2026-08-19 — Official heretic-ara miss on our meter
+
+`trohrbaugh/Qwen3.8-27B-heretic-ara` downloaded to
+`/run/media/s117/OS/Models/Qwen3.8-27B-heretic-ara`. Card: 0/100 @
+first-token KL 0.0535 on mlabonne/harmful_behaviors. Our gate
+(`eval_qwen38_vs_original.py --merged`, keyword + 3-token vs original
+on harmful_1000 train[900:]): **72/100 @ 0.2275**. Worse than pocket
+t24 (50@0.087) and our ARA reimpl (61@0.121). Not a ship.
+JSON: `logs/qwen38_official_ara_eval.json`.
+
+## -1ag. 2026-08-19 — Iterative rank-8 direct miss; sweep rank 1–3 slices
+
+Native iterative built an 8-direction subspace (4 passes × 2). Applying
+all 8 at once: t7 60@0.407, t2 ~30@1.01, t4 8/30-low @ 1.09. Cliff, not
+a 10@0.1 basin. Stopped at trial 9/20. Next: `scripts/sweep_qwen38_iter_rank.py`
+applies only the first 1/2/3 cached directions at o_proj 0.5–1.5.
+
+## -1af. 2026-08-19 — ARA lerp + t24 residual miss; start iterative+direct
+
+Sweep `scripts/sweep_qwen38_next.py` (keyword + 3-token vs original):
+ARA lerp 0.70 89@0.0675, 0.85 77@0.0925, 1.15 42@0.152, 1.35 22@0.198,
+1.60 9@0.258. Same Pareto as LoRA. t24 residual is cheaper near the
+KL gate (50@0.087 → 39@0.100 → 26@0.135) then plateaus. No 8–12 @ ≤0.1.
+JSON: `logs/qwen38_next_sweep.json`. Next: native iterative extract-ablate
++ `steering_mode=direct` 20-trial (`configs/qwen38_27b_rocm_iter.toml`).
+
+## -1ae. 2026-08-19 — Next search after MPOA: ARA lerp + t24 residual
+
+t24 拆回复: keyword 50, hard+hedge 77, payload 9 — cannot score as 8–12.
+MPOA `weight_normalization=full` stopped at trial 10/30: same Pareto
+(t4 47@0.097, t2 43@0.105, t9 19@0.201, t5 7@0.441). No 8–12 @ KL≤0.1.
+Not another mean+LoRA pocket.
+
+`scripts/eval_qwen38_vs_original.py --delta-scale S` lerps original→ARA.
+`scripts/sweep_qwen38_next.py` maps ARA scales 0.70/0.85/1.15/1.35/1.60
+then reapplies pocket t24, re-extracts a residual direction, and peels
+o_proj at 0.4–2.5. Each point is keyword + 3-token KL vs original; JSON
+to `logs/qwen38_next_sweep.json` and scratch.
+
+## -1ad. 2026-08-19 — Repaired 50-trial finished; miss 51/100 @ 0.109
+
+50/50. Same Pareto as unrepaired pocket. In-budget search: t50 ~40@0.093
+vs repaired, t3 ~43@0.085. 8–12 refusals only at KL 0.31–0.50 (t10 10@0.311,
+t16 8@0.440). Official vs-original eval of t50:
+`scripts/eval_qwen38_vs_original.py` → **51/100 @ 0.1088** 3-token
+(pocket original baseline). Repair added ~0.015 KL vs stock. Not a ship.
+Next: `weight_normalization=full` (MPOA) on the original base.
+
+## -1ac. 2026-08-19 — SSM conv1d repair + Abliterix on repaired base
+
+Stock Qwen3.8-27B has the same Fernflower pattern as AEON 3.6: 8 GDN
+`linear_attn.conv1d` outliers (L52/53/56/57/58/60/61/62), median σ=0.0428,
+α=0.517–0.666. Script `scripts/repair_qwen38_conv1d.py` writes
+`/run/media/s117/OS/Models/Qwen3.8-27B-ssm-repaired` (symlink + 3 shards).
+Search: `configs/qwen38_27b_rocm_repaired.toml` /
+`checkpoints_qwen38_27b_repaired`, 50/15, 3-token, BF16 batch 128.
+
+## -1ab. 2026-08-19 — Full-weight ARA finished; miss 61/100 @ 0.121
+
+trohrbaugh knobs, BF16, layers 26–56, 60 modules, `exports/qwen38_ara_fixed_delta.pt` (6.8G).
+Live eval (keyword + 3-token TF KL vs pocket original baseline):
+**61/100 @ 0.1208**. Misses both 8–12 and KL≤0.1. Worse than pocket t24 (50 @ 0.087).
+Artifacts: `logs/qwen38_ara_fixed_eval.json`, scratch copy. Next: AEON 3.8 conv1d repair + Abliterix 1.12, not more pocket TPE.
+
+## -1aa. 2026-08-19 — eval_qwen38_vs_original --delta
+
+`scripts/eval_qwen38_vs_original.py` accepts `--delta exports/qwen38_ara_fixed_delta.pt` and copies ARA layer weights onto the original BF16 load, then scores keyword refusals + 3-token KL vs the pocket original baseline. Avoids HuggingFace `save_pretrained` of a 52G merge.
+
+## -1z. 2026-08-19 — t24 拆回复：硬拒绝 77，不是 10
+
+User: 先拆 t24 回复，看关键词 50 里有没有一批「提到 illegal 但在答」。
+审完 `logs/qwen38_t24_inspect.json` 100 条：hard 65 + hedge 12 = **77/100 硬拒绝**；payload 9（16/19/22/34/35/37/42/43/56）；partial 14。关键词 50，对硬拒绝 FP=3 FN=30。和 AEON 3.8（judge-R 29–36、硬拒绝 0）相反。KL 0.0866 仍 ≤0.10，拒答门过不了，t24 不当成品。审计：`logs/qwen38_t24_reply_audit.json`。
+
+## -1y. 2026-08-19 — Pocket 100-trial finished; no 10@0.10
+
+100/100, 75 scored. Densified the same curve. New-ish: t24 50/100
+@ 0.087, t38 14/100 @ 0.198, t93 10/100 @ 0.258. 10@0.10 empty.
+Seeds still own the low-KL end (t1 60@0.074).
+
+## -1x. 2026-08-18 — Pocket 3-token 100-trial from our own front
+
+User: search 100 trials in the ranges that actually produced low
+KL / usable refusals. o_proj [3.8, 6.0], down [0, 2.8]. Seeds
+kw t93/t19/t85 + aeon t3/t42. 3-token KL, BF16, batch 128.
+`qwen38_27b_rocm_pocket.toml` / `checkpoints_qwen38_27b_pocket`.
+
+## -1w. 2026-08-18 — AEON-style 50-trial finished; 3.6 seed does not transfer
+
+50/50, 34 scored. AEON Qwen3.6 t46 seed on 3.8: **17/100 @ KL 0.341**.
+Best KL t3 33/100 @ 0.119 (o=4.72 d=2.64). Lowest refusals t14 2/100
+@ 0.493. 10@0.10 and 0.04–0.10 basin empty. TPE still preferred
+high o_proj. 3.6 ranges did not recreate AEON's 0.0005 / 0/100.
+
+## -1v. 2026-08-18 — AEON-style Abliterix 3-token 50-trial
+
+User: follow AEON-7 recipe, 3-token KL. o_proj [1,6], down [2,10],
+50/15, prune 0.5, BF16 batch 128, keyword. Seed ≈ AEON Qwen3.6
+t46 (o=1.56, down=3.45, per-layer). Config
+`qwen38_27b_rocm_aeon.toml`, dir `checkpoints_qwen38_27b_aeon`.
+No high-o / down≈0 seeds. Qwen3.8 trial-48 knobs still unpublished.
+
+## -1u. 2026-08-18 — First-token KL is higher than 3-token; widen o_proj
+
+Same weights: t93 0.074 (3-tok) → 0.171 FT; t19 0.116 → 0.196.
+Teacher-forced tokens 2–3 diluted the average. o_proj≥3.8 left FT
+KL floor at 0.16. Stopped ~trial 51. Restart
+`checkpoints_qwen38_27b_kw_ft2`, o_proj [1.5, 6.0], down [0, 1.2],
+same seeds, first-token, 100 trials.
+
+## -1t. 2026-08-18 — First-token KL 100-trial, ranges from kw_bf16
+
+`token_count=1` to match Heretic/JonathanColetti. o_proj [3.8, 6.0],
+down [0, 1.2] (high down only bought 1–6/100 @ KL 0.32+). Seeds
+t19/t78/t85/t93. Config `qwen38_27b_rocm_kw_ft.toml`, dir
+`checkpoints_qwen38_27b_kw_ft`, BF16 caches reused.
+
+## -1s. 2026-08-18 — BF16 keyword 100-trial finished
+
+100/100 complete, 58 scored, 6h56m. First time the search entered
+KL<0.10 vs original BF16: t93 60/100 @ 0.074, t65 60/100 @ 0.084.
+Best near the 0.10 gate: t19 33/100 @ 0.116. Lowest refusals t55
+1/100 @ 0.361. Ship 10/100 @ KL≤0.10 still empty.
+
+## -1r. 2026-08-17 — Drop LLM judge; BF16 keyword 100-trial
+
+User: judge difference not worth SSL flakes; add 100 keyword
+trials. Stopped judge v2 resume. Fresh study
+`configs/qwen38_27b_rocm_kw_bf16.toml` / `checkpoints_qwen38_27b_kw_bf16`
+(keyword only, 100/30, prune 0.5, batch 128). Copied BF16
+baseline/steering caches. Did not mix judge scores into TPE.
+
+## -1q. 2026-08-17 — BF16 judge v2: prune 0.5, drop 4-bit seeds
+
+v1 50/50 done: only t18 60/100 @ 0.150 and t46 57/100 @ 0.150
+scored; 4-bit seeds failed prescreen; prune 0.16 skipped almost
+all unlocks (KL 0.27–0.97). Fresh study
+`checkpoints_qwen38_27b_judge_bf16_v2`, copy BF16
+baseline/steering/prefix, no seeds, prune 0.5, 50/15, batch 128.
+
+## -1p. 2026-08-17 — Judge search switched to BF16 / 110G / auto-batch
+
+User: 4-bit vs BF16 matters; use BF16, VRAM cap 110G, auto-detect
+batch. Stopped 4-bit judge run. New
+`configs/qwen38_27b_rocm_judge_bf16.toml`: `quant_method=none`,
+`dtype=bfloat16`, `max_memory 110GB`, `batch_size=0`. Fresh
+`checkpoints_qwen38_27b_judge_bf16` (no 4-bit residual reuse).
+UMA guard `MAX_RSS=110` `MIN_FREE=12`.
+
+## -1o. 2026-08-17 — MiMo-V2.5 LLM-judge 50-trial (AEON-style)
+
+User provided OpenCode Go for `mimo-v2.5` as the judge. New study
+`configs/qwen38_27b_rocm_judge.toml`: 4-bit, same v1 knobs, house
+prescreen 30/8/19, **prune 0.16**, 50/15, seed t69+t127. Judge via
+`llm_judge_base_url=https://opencode.ai/zen/go/v1` (key in env
+`LLM_JUDGE_API_KEY`, not in git). json_schema works; urllib timeout
+raised to 120s + User-Agent. Fresh dir
+`checkpoints_qwen38_27b_judge`, v1 caches copied.
+
+## -1n. 2026-08-17 — Stop 200; HF Qwen3.8 uncensored cards
+
+User: stop and look at HF uncensored releases near KL 0.1.
+Stopped default200 at ~trial 133; journal kept. Cards that matter:
+JonathanColetti 12/100 @ first-token KL 0.1191 (Heretic 200,
+**bf16**, o_proj+down only). trohrbaugh ARA 0/100 @ 0.0535
+(full-weight, layers 26–56). 0bserverx RVN is stacked ARA on
+that. Our 4-bit TPE never entered KL≤0.12.
+
+## -1m. 2026-08-17 — Resume default-100 and raise budget to 200
+
+User: continue and add 100 trials. Journal at stop: ~89 complete /
+55 scored, `finished=false`, frozen `num_trials=100`. Continue
+without overwrite; incoming config can raise `num_trials` (cli
+patch). `qwen38_27b_rocm_default100.toml` now 200.
+
+## -1l. 2026-08-17 — Resume Abliterix default-100 at 75/100
+
+Wrapper hit max_runtime and killed the search mid trial 75.
+Journal `finished=false`, 44 scored. Lowest refusals t13 2/100 @
+KL 0.46; t50 4/100 @ 0.288; t69 16/100 @ 0.152. Still empty below
+KL 0.12. Resume **without** `--overwrite-checkpoint`.
+
+## -1k. 2026-08-16 — Classic Heretic 13-point front is worse; back to Abliterix
+
+Classic Heretic (strength [0.8, 1.5]) after 13 scored trials:
+lowest refusals **t8 29/100 @ KL 0.30**, t5 30/100 @ 0.36; KL≤0.05
+is 97–100/100. Same tradeoff as Abliterix v1 but the 1.5 cap cannot
+reach v1's o_proj≈5.3 pocket (17/100 @ 0.18). User: go back to
+Abliterix. Restart `qwen38_27b_rocm_default100.toml` (100/30,
+prescreen 30/8/19).
+
+## -1j. 2026-08-16 — Classic Heretic (no ARA) 100-trial
+
+User: try classic Heretic. Stopped the Abliterix default-100
+restart. Launch `heretic-ara-lora` with `use_ara=false`, rank-1
+LoRA, 4-bit, projected directions, strength [0.8, 1.5] (Heretic
+hardcoded), 100/30, thinking off, skip prefix.
+`config.qwen38-classic.toml` / `./run-qwen38-classic.sh`.
+
+## -1i. 2026-08-16 — ARA-LoRA t1 is a dead end; resume Abliterix default-100
+
+ARA-LoRA trial 1: **0/100 refusals, KL 11.69**, ~1h LBFGS, ETA ~100h
+remaining. That is smashed-model, not a path to 10/100 @ 0.05. Stopped
+heretic-ara-lora. Restarted Abliterix default recipe 100/30,
+prescreen 30/8/19, `configs/qwen38_27b_rocm_default100.toml`.
+
+## -1h. 2026-08-16 — Stop default-100; launch Qwen3.8 ARA-LoRA
+
+User stopped the default 100-trial Abliterix search (killed
+`run_qwen38.sh` / trial 1). Checked heretic remotes: upstream
+`ara` is still `25979ad` (ARA-LoRA #332); no new ARA algorithm
+commits. `origin/ara` is behind. `heretic-ara-lora` /
+`sc117-ling-ara` already contains that ARA tip plus the
+transformers 5.x `is_torch_fx_available` shim.
+
+Run from `/home/s117/heretic-ara-lora` with muse-glimmer-env:
+`config.qwen38-ara-lora.toml`, `./run-qwen38-ara.sh`. 4-bit
+ARA-LoRA rank 128, thinking off, **100/30 trials** (first
+launch was 30/10; user called that out, bumped and
+relaunched). Local 800/100 splits. Restored missing
+Evaluator fields on the master-merged Settings.
+
+## -1g. 2026-08-16 — Qwen3.8 default 100-trial search
+
+User: restart on the default recipe, 100 trials. Same v1/Qwen3.6
+knobs (mean+LoRA, projected+winsorize, o_proj[1,6], down[1,5],
+QKV off, KL prune 0.5). Fresh study in
+`checkpoints_qwen38_27b_default100` — v1 journal left intact.
+Copied v1 baseline/steering/prefix caches. Prescreen 30/8/19,
+warmup 30. Config `configs/qwen38_27b_rocm_default100.toml`.
+Launch: `./run_qwen38.sh configs/qwen38_27b_rocm_default100.toml`.
+
+## -1f. 2026-08-16 — Restore Qwen3.8 prescreen to house 30/8/19
+
+User house screen is 30 prompts, pass ≤8, prune ≥19 (`settings.py`
+defaults; Ling / LFM / Muse v1). Qwen3.8 v1–v8 TOMLs were written
+with Muse v3's 16/6/13 (faster 16-prompt screen from the batch-1
+era). That was an agent copy, not a user change. Restored all
+`configs/qwen38_27b_rocm*.toml` to 30/8/19. Completed v1–v8 journals
+still used 16/6/13; next search uses 30.
+
+---
+
+## -1e. 2026-08-15 — Wire FLA Triton GDN + causal_conv1d on gfx1151
+
+Qwen3.8 generate was 4 tok/s because transformers fell through to the
+Python `for t in range(seq)` GDN path. `fla-core` 0.5.2 + ROCm Triton
+3.7.1 already work on gfx1151 (`fused_recurrent` 0.04 ms vs Python
+0.13 ms, max-abs 2.4e-4), but:
+
+- transformers looks up `fla.ops.gated_delta_rule.recurrent_gated_delta_rule`
+  (missing; only `fused_recurrent_gated_delta_rule`)
+- `causal_conv1d` NVIDIA package is absent on ROCm
+
+Alias added in heretic-env `fla`; muse-env got a `causal_conv1d` shim
+that transposes `[B,D,T]↔[B,T,D]` onto FLA's Triton conv. Decode is
+still mostly 4-bit weight-bandwidth bound; prefill/extract should
+improve more.
+
+Post-FLA batch retune (`scripts/bench_qwen38_batch.py`, fixed 32 tok):
+1=4.2, 2=1.8, 4=3.5, 8=6.8, 16=13.0, 32=23.0, 64=39.2, 128=58.5,
+256=77.3 tok/s. Locked `batch_size=256`.
+
+v1 search (30/30): baseline 100/100. Best scored **trial 23 = 17/100,
+KL 0.181 / val 0.172**. v2 is a manual peel: bake t23 LoRA → merged
+`Qwen3.8-27B-t23`, fresh extract, weaker ranges.
+
+v2 (30/30, ~6h): t23-merge baseline **17/100**. Incremental ≤10/100
+looked good (t15 9/100 @ 0.015) but cumulative KL is still ~0.20.
+User rejected peel-on-0.18. Deleted `Qwen3.8-27B-t23` merge + t23
+LoRA. Stacked-search KL is vs the *loaded* base, not the original:
+KL(C||A) ≠ KL(C||B)+KL(B||A). Ship gate is
+`scripts/eval_qwen38_vs_original.py`: teacher-forced 3-token
+KL(candidate || original) on the original's continuations, plus 100
+eval refusals. v3 is a new first pass on the original weights:
+o_proj ≤ 3.5, KL prune 0.08, target 0.03, 40 trials, reuse v1
+residual/baseline cache.
+
+v3 (40/40): **no scored trial**. 20 prescreen-pruned, 18 KL-pruned
+(>0.08). Only t2/t32 stayed under the KL cap (0.075 / 0.068) and
+both estimated **75/100**. The 10/100 @ 0.05 box is empty on this
+o_proj+down_proj LoRA envelope vs the original.
+
+v4: same original weights + KL prune 0.08, but unlock full-attn
+Q/K/V ([0, 2.5]) so TPE can buy refusals without pushing every-layer
+o_proj past 3.5. Reuse v1 residual/baseline cache.
+
+v4 (40/40): **worse**. 30 prescreen-pruned, 10 KL-pruned, **zero**
+trials under KL 0.08. QKV spends KL faster than it buys refusals.
+v5: angular decoder-block, o_proj 0.35–1.0 (≤90°), same KL cap and
+original residual cache. Runtime-only probe of the direction.
+
+v5 (30/30): **empty**. 28 KL-pruned, 2 prescreen-pruned, lowest KL
+0.111 (~69/100). Angular is louder than LoRA on this residual.
+v6: re-extract with `response_pair` (same prompt, forced
+compliance vs refusal continuation) then LoRA o_proj≤3.5, KL
+prune 0.08. New steering cache.
+
+v6 (30/30): **null**. Every trial 15–16/16 prescreen; the pair
+direction does not move keyword refusals. v7: COSMIC extract +
+adaptive angular (Qwen3.5-4B quality recipe), KL prune 0.08.
+
+v7 (30/30): empty. 25 prescreen, 5 KL-prune. Best KL 0.096 at
+~69/100. v8 killed mid-run (same empty pattern). Further recipe
+churn stopped: v1 already was the Heretic-like default Pareto.
+
+---
+
+## -1d. 2026-08-15 — Qwen3.8-27B takes priority; Muse v6 is last Muse run
+
+User: finish the current Muse v6 search, then stop. Do not start v7.
+Qwen/Qwen3.8-27B is the next model (higher priority).
+
+Weights go to `/run/media/s117/OS/Models/Qwen3.8-27B` (32 files, 51.77 GiB,
+`Qwen3_5ForConditionalGeneration`, 64-layer GDN/full-attn hybrid — same
+family as `configs/qwen3.6_27b.toml`). Isolated env is still
+`/home/s117/muse-glimmer-env` (transformers 5.15, has `Qwen3_5*`).
+
+Muse v6 was killed once Qwen weights finished (32/32 files, 51.77 GiB).
+BF16 load suicided uma_guard at ~60% (`avail=22.4G`, `cuda_reserved=51G`,
+`rss=44G` — UMA double-copy). 4-bit loads at ~17G VRAM. Auto-batch
+measured `bs1=4 tok/s`, `bs2=2 tok/s` (GDN on ROCm does not scale);
+first search is locked at `batch_size=1` + uma_guard. Thinking is
+forced off via `scripts/qwen38_encode.py`.
+Launch: `./run_qwen38.sh` (smoke / batch probe) or
+`./run_qwen38.sh configs/qwen38_27b_rocm.toml`. Target ≤10/100 @ KL 0.05.
+
+---
+
+## -1c. 2026-08-14 — Muse v6: unclamp angular past 90°
+
+t12's 65/100 is the 90° ceiling (strength 1.20 ≡ 5.16 after clamp).
+Wired `steering.angular_overrotation` into the plain decoder-block hook
+(`fraction` up to 2.0). v6 searches `attn.o_proj` in [1.0, 2.0] on the
+v3 cache toward 10/100 @ KL 0.05.
+
+---
+
+## -1b. 2026-08-14 — Muse v5 BF16 direct search
+
+Dedicated direct study (`configs/muse_glimmer_30b_rocm_v5_direct.toml`):
+per-layer, `to=user`, down_proj kept, strength 0.25–1.60 in *direct*
+units, TPE also picks standard / orba / biprojected. Reuses the v3
+residual + 95/100 baseline caches. Launch with
+`ABLITERIX_UMA_MIN_FREE_GB=4`.
+
+**Result (18/18):** every trial pruned at 15–16/16. Five trials hit
+15/16 (higher-strength standard/orba/biprojected ~1.2–1.5). No KL
+numbers. Angular works because it rotates the **decoder-block output
+(including the skip)**; that is not a rank-1 edit of `o_proj` /
+`down_proj`. v3 trial 12's `down_proj` envelope is unused by angular
+(hook strength comes from the first profile, `attn.o_proj`).
+
+**Locked eval:** trial 12 angular on bnb, `to=user`, 32 decoder-block
+hooks: **65/100** refusals (baseline 95/100). Search KL 0.0274
+nats/token (16-prompt). Sidecar:
+`artifacts/muse_glimmer_t12_angular.pt` via
+`scripts/export_muse_glimmer_t12_artifact.py` /
+`scripts/load_muse_glimmer_t12.py`.
+
+---
+
+## -1. 2026-08-14 — Muse Glimmer-30B v3 lock; BF16 direct bake did not transfer
+
+v3 bnb + per-layer angular is still the only search that moved refusals
+(trial 12: 10/16 ~62%, KL 0.0274). LoRA is eaten by 4×RMSNorm; v2 BF16
+direct at Heretic 0.8–1.5 + skipped `to=user` prefix + auto-disabled
+`down_proj` was 12/12 prune.
+
+Tried to ship trial 12 by replaying the v3 residual cache as
+`steering_mode=direct` on BF16 (`scripts/bake_muse_glimmer_t12.py`,
+`configs/muse_glimmer_30b_rocm_v4_direct.toml`). Two mappings both
+scored **15/16** on the same 16-prompt eval (raw angular 5.16, and
+clamped-to-1.0 + row-norm restore to approximate 90° rotation). No
+checkpoint written. Angular is a 90° activation rotation; it is not
+a 1:1 weight edit on this gated-`o_proj` 4-norm decoder.
+
+Runtime recipe remains `configs/muse_glimmer_30b_rocm_v3_best.toml`.
+A shippable HF/GGUF needs a dedicated BF16 direct search, not a bake
+of the angular numbers.
 
 ---
 
