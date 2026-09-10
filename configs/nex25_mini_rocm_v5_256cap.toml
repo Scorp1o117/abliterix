@@ -1,0 +1,331 @@
+# Nex-N2.5-mini — V5: V4 recipe + faithful prescreen bands for the 256-token cap.
+#
+# Cap calibration measured on the SAME profile (o 0.808 / down 2.298, KL identical
+# at 0.0594): 160-token prescreen 6/30 and 12/100 full eval, 256-token prescreen
+# 12/30 — the longer cap exposes late refusals and long-form degeneration that the
+# 160-token run never sees (response-length deviation 0.21 -> 0.93). The gpt-oss
+# notes record exactly this blind spot, and its shipped recipe runs at 256, so the
+# 256 cap is the faithful target here; 160-token numbers stay comparable to the
+# historical Ornith/Ling/Qwen3.8 bars.
+#
+# Prescreen bands widened (pass <=18/30, prune >=25/30) because the old 8/19 bands
+# reduced the interesting 12-18/30 region to a 30-prompt extrapolation, so the
+# search optimised an estimate instead of a measurement.
+#
+# v2 (direct+EGA, norm=none, no routing) plateaued at 11-12/100 refusals @ KL 0.06-0.15.
+# A full-vs-none A/B (configs/nex25_mini_rocm_sweep_full.toml) showed the Ling lesson
+# (norm=full as the only low-KL basin) does NOT transfer here: curves overlap within
+# noise. Remaining untried lever is the one the shipped gpt-oss recipe uses:
+# direct + EGA on fused experts + MoE router suppression (6/100 @ KL 0.0098 there).
+# Also: max_gen_tokens 160 -> 256, because that recipe records a 150-token blind spot
+# where long-form collapse (repetition / metaphor deflection) stays invisible.
+#
+# V1 (LoRA) was aborted during its baseline phase after the A/B sweep showed that
+# LoRA can only reach the shared expert: fused experts cannot be wrapped by PEFT,
+# so the 256-expert path (92% of the checkpoint) was never steered. Direct mode
+# runs Expert-Granular Abliteration across all 256 experts and is ~7x more
+# KL-efficient here (0/8 refusals at KL 0.052 vs 0.395 for LoRA; see
+# configs/nex25_mini_rocm_sweep_direct.toml vs nex25_mini_rocm_sweep.toml).
+#
+# Nex-N2.5-mini is a Nex-AGI post-trained Qwen3.5-35B-A3B derivative and is
+# ARCHITECTURALLY IDENTICAL to Ornith-1.5-35B-A3B (40 layers, hidden 2048,
+# 256 experts, moe_inter 512, GatedDeltaNet hybrid 3 linear + 1 full, BF16
+# 70.2 GB on disk). The V4 recipe below is therefore transferred verbatim from
+# Ornith-1.5, including its seed trials (same 40-layer indexing).
+#
+# Two model-specific points:
+#   * text_only = true  — the checkpoint is a VL wrapper (Qwen3_5Moe
+#     ForConditionalGeneration with a vision tower). Abliterix steers the
+#     language model only; upstream moved this from an implicit model_type
+#     check to this explicit switch.
+#   * custom encoder    — the bundled template opens a bare <think> block
+#     unless reasoning_effort is given; the encoder forces "none" so the
+#     model answers instead of burning the eval budget on a thinking trace.
+#
+# Search space calibrated by configs/nex25_mini_rocm_sweep.toml (2026-09-10):
+# baseline 8/8 refusals; 1.0x -> 0/8 @ KL 0.395, 0.5x -> 1/8 @ 0.122,
+# 0.25x -> 6/8 @ 0.034. Ranges below bracket the 0.3x-1.1x window.
+#
+# BF16 (quant_method = "none"): the experts are fused 3-D tensors
+# (mlp.experts.gate_up_proj / .down_proj, 64.4 GB = 92% of the checkpoint), so
+# bitsandbytes would leave them in full precision anyway.
+
+system_prompt = "You are a helpful assistant."
+
+[model]
+model_id = "/run/media/s117/OS/Models/Nex-N2.5-mini"
+dtype_fallback_order = ["bfloat16"]
+quant_method = "none"
+use_torch_compile = false
+device_map = "auto"
+trust_remote_code = true
+# VL wrapper checkpoint: steer the language model only.
+text_only = true
+# Force reasoning_effort="none" (empty thinking block) for eval stability.
+custom_encoder_module = "scripts/nex25_encode.py"
+custom_encoder_kwargs = {reasoning_effort = "none"}
+
+[inference]
+batch_size = 128
+min_batch_size = 1
+max_batch_size = 128
+skip_common_response_prefix = true
+min_gen_tokens = 32
+max_gen_tokens = 256
+
+[steering]
+steering_mode = "direct"
+vector_method = "mean"
+decay_kernel = "linear"
+orthogonal_projection = true
+projected_abliteration = true
+winsorize_vectors = true
+winsorize_quantile = 0.995
+weight_normalization = "none"
+discriminative_layer_selection = false
+search_harmfulness_direction = false
+strength_range = [0.4, 1.7]
+min_weight_frac_max = 0.6
+disabled_components = []
+
+[steering.component_strength_ranges]
+"mlp.down_proj" = [1.5, 4.5]
+"attn.o_proj" = [0.4, 1.7]
+"attn.q_proj" = [0.1, 0.7]
+"attn.k_proj" = [0.1, 0.7]
+"attn.v_proj" = [0.1, 0.7]
+
+# Router suppression ON (shipped gpt-oss recipe: direct + EGA on fused experts +
+# MoE router suppression gave 6/100 @ KL 0.0098). Expert ablation stays pinned
+# off — EGA already owns the expert down_proj weights.
+[experts]
+max_suppress = 6
+router_bias_range = [-5.0, 0.0]
+ablation_weight_range = [0.0, 0.0]
+
+[optimization]
+num_trials = 40
+num_warmup_trials = 16
+sampler_seed = 117
+checkpoint_dir = "checkpoints_nex25_mini_v5_256cap"
+refusal_prescreen_enabled = true
+refusal_prescreen_size = 30
+refusal_prescreen_pass_max = 18
+refusal_prescreen_prune_min = 25
+refusal_prescreen_seed = 117
+validation_kl_enabled = true
+validation_kl_size = 20
+generation_health_enabled = true
+thinking_leak_detection_enabled = true
+
+# Wide MPOA t39 envelope on o/down; QKV mid of their new ranges.
+[[optimization.seed_trials]]
+# KL-edge 0.33x: strongest profile still inside the KL<=0.1 budget
+vector_scope = "per layer"
+"attn.o_proj.max_weight" = 1.066
+"attn.o_proj.max_weight_position" = 36.22
+"attn.o_proj.min_weight" = 0.4613
+"attn.o_proj.min_weight_distance" = 13.94
+"mlp.down_proj.max_weight" = 3.033
+"mlp.down_proj.max_weight_position" = 37.15
+"mlp.down_proj.min_weight" = 0.3515
+"mlp.down_proj.min_weight_distance" = 12.53
+"attn.q_proj.max_weight" = 0.495
+"attn.q_proj.max_weight_position" = 22.0
+"attn.q_proj.min_weight" = 0.3333
+"attn.q_proj.min_weight_distance" = 10.0
+"attn.k_proj.max_weight" = 0.495
+"attn.k_proj.max_weight_position" = 22.0
+"attn.k_proj.min_weight" = 0.3333
+"attn.k_proj.min_weight_distance" = 10.0
+"attn.v_proj.max_weight" = 0.495
+"attn.v_proj.max_weight_position" = 22.0
+"attn.v_proj.min_weight" = 0.3333
+"attn.v_proj.min_weight_distance" = 10.0
+"moe.n_suppress" = 0
+"moe.router_bias" = 0.0
+[[optimization.seed_trials]]
+# KL-edge 0.33x + gentle routing (gpt-oss winners clustered near -3.76)
+vector_scope = "per layer"
+"attn.o_proj.max_weight" = 1.066
+"attn.o_proj.max_weight_position" = 36.22
+"attn.o_proj.min_weight" = 0.4613
+"attn.o_proj.min_weight_distance" = 13.94
+"mlp.down_proj.max_weight" = 3.033
+"mlp.down_proj.max_weight_position" = 37.15
+"mlp.down_proj.min_weight" = 0.3515
+"mlp.down_proj.min_weight_distance" = 12.53
+"attn.q_proj.max_weight" = 0.495
+"attn.q_proj.max_weight_position" = 22.0
+"attn.q_proj.min_weight" = 0.3333
+"attn.q_proj.min_weight_distance" = 10.0
+"attn.k_proj.max_weight" = 0.495
+"attn.k_proj.max_weight_position" = 22.0
+"attn.k_proj.min_weight" = 0.3333
+"attn.k_proj.min_weight_distance" = 10.0
+"attn.v_proj.max_weight" = 0.495
+"attn.v_proj.max_weight_position" = 22.0
+"attn.v_proj.min_weight" = 0.3333
+"attn.v_proj.min_weight_distance" = 10.0
+"moe.n_suppress" = 3
+"moe.router_bias" = -2.0
+[[optimization.seed_trials]]
+# v2 winner (160-cap 12/100 @ KL 0.059) — cap-offset reference
+vector_scope = "per layer"
+"attn.o_proj.max_weight" = 0.808
+"attn.o_proj.max_weight_position" = 36.22
+"attn.o_proj.min_weight" = 0.4613
+"attn.o_proj.min_weight_distance" = 13.94
+"mlp.down_proj.max_weight" = 2.298
+"mlp.down_proj.max_weight_position" = 37.15
+"mlp.down_proj.min_weight" = 0.3515
+"mlp.down_proj.min_weight_distance" = 12.53
+"attn.q_proj.max_weight" = 0.375
+"attn.q_proj.max_weight_position" = 22.0
+"attn.q_proj.min_weight" = 0.3333
+"attn.q_proj.min_weight_distance" = 10.0
+"attn.k_proj.max_weight" = 0.375
+"attn.k_proj.max_weight_position" = 22.0
+"attn.k_proj.min_weight" = 0.3333
+"attn.k_proj.min_weight_distance" = 10.0
+"attn.v_proj.max_weight" = 0.375
+"attn.v_proj.max_weight_position" = 22.0
+"attn.v_proj.min_weight" = 0.3333
+"attn.v_proj.min_weight_distance" = 10.0
+"moe.n_suppress" = 0
+"moe.router_bias" = 0.0
+[[optimization.seed_trials]]
+# 0.25x + full router suppression
+vector_scope = "per layer"
+"attn.o_proj.max_weight" = 0.808
+"attn.o_proj.max_weight_position" = 36.22
+"attn.o_proj.min_weight" = 0.4613
+"attn.o_proj.min_weight_distance" = 13.94
+"mlp.down_proj.max_weight" = 2.298
+"mlp.down_proj.max_weight_position" = 37.15
+"mlp.down_proj.min_weight" = 0.3515
+"mlp.down_proj.min_weight_distance" = 12.53
+"attn.q_proj.max_weight" = 0.375
+"attn.q_proj.max_weight_position" = 22.0
+"attn.q_proj.min_weight" = 0.3333
+"attn.q_proj.min_weight_distance" = 10.0
+"attn.k_proj.max_weight" = 0.375
+"attn.k_proj.max_weight_position" = 22.0
+"attn.k_proj.min_weight" = 0.3333
+"attn.k_proj.min_weight_distance" = 10.0
+"attn.v_proj.max_weight" = 0.375
+"attn.v_proj.max_weight_position" = 22.0
+"attn.v_proj.min_weight" = 0.3333
+"attn.v_proj.min_weight_distance" = 10.0
+"moe.n_suppress" = 6
+"moe.router_bias" = -4.0
+[[optimization.seed_trials]]
+# 0.35x + mid router suppression
+vector_scope = "per layer"
+"attn.o_proj.max_weight" = 1.131
+"attn.o_proj.max_weight_position" = 36.22
+"attn.o_proj.min_weight" = 0.4613
+"attn.o_proj.min_weight_distance" = 13.94
+"mlp.down_proj.max_weight" = 3.217
+"mlp.down_proj.max_weight_position" = 37.15
+"mlp.down_proj.min_weight" = 0.3515
+"mlp.down_proj.min_weight_distance" = 12.53
+"attn.q_proj.max_weight" = 0.525
+"attn.q_proj.max_weight_position" = 22.0
+"attn.q_proj.min_weight" = 0.3333
+"attn.q_proj.min_weight_distance" = 10.0
+"attn.k_proj.max_weight" = 0.525
+"attn.k_proj.max_weight_position" = 22.0
+"attn.k_proj.min_weight" = 0.3333
+"attn.k_proj.min_weight_distance" = 10.0
+"attn.v_proj.max_weight" = 0.525
+"attn.v_proj.max_weight_position" = 22.0
+"attn.v_proj.min_weight" = 0.3333
+"attn.v_proj.min_weight_distance" = 10.0
+"moe.n_suppress" = 3
+"moe.router_bias" = -2.5
+[[optimization.seed_trials]]
+# 0.50x + full router suppression
+vector_scope = "per layer"
+"attn.o_proj.max_weight" = 1.615
+"attn.o_proj.max_weight_position" = 36.22
+"attn.o_proj.min_weight" = 0.4613
+"attn.o_proj.min_weight_distance" = 13.94
+"mlp.down_proj.max_weight" = 4.595
+"mlp.down_proj.max_weight_position" = 37.15
+"mlp.down_proj.min_weight" = 0.3515
+"mlp.down_proj.min_weight_distance" = 12.53
+"attn.q_proj.max_weight" = 0.750
+"attn.q_proj.max_weight_position" = 22.0
+"attn.q_proj.min_weight" = 0.3333
+"attn.q_proj.min_weight_distance" = 10.0
+"attn.k_proj.max_weight" = 0.750
+"attn.k_proj.max_weight_position" = 22.0
+"attn.k_proj.min_weight" = 0.3333
+"attn.k_proj.min_weight_distance" = 10.0
+"attn.v_proj.max_weight" = 0.750
+"attn.v_proj.max_weight_position" = 22.0
+"attn.v_proj.min_weight" = 0.3333
+"attn.v_proj.min_weight_distance" = 10.0
+"moe.n_suppress" = 6
+"moe.router_bias" = -4.0
+[[optimization.seed_trials]]
+# down-heavy 0.25x + mid suppression
+vector_scope = "per layer"
+"attn.o_proj.max_weight" = 0.500
+"attn.o_proj.max_weight_position" = 36.22
+"attn.o_proj.min_weight" = 0.4613
+"attn.o_proj.min_weight_distance" = 13.94
+"mlp.down_proj.max_weight" = 3.500
+"mlp.down_proj.max_weight_position" = 37.15
+"mlp.down_proj.min_weight" = 0.3515
+"mlp.down_proj.min_weight_distance" = 12.53
+"attn.q_proj.max_weight" = 0.200
+"attn.q_proj.max_weight_position" = 22.0
+"attn.q_proj.min_weight" = 0.3333
+"attn.q_proj.min_weight_distance" = 10.0
+"attn.k_proj.max_weight" = 0.200
+"attn.k_proj.max_weight_position" = 22.0
+"attn.k_proj.min_weight" = 0.3333
+"attn.k_proj.min_weight_distance" = 10.0
+"attn.v_proj.max_weight" = 0.200
+"attn.v_proj.max_weight_position" = 22.0
+"attn.v_proj.min_weight" = 0.3333
+"attn.v_proj.min_weight_distance" = 10.0
+"moe.n_suppress" = 3
+"moe.router_bias" = -2.5
+[kl]
+scale = 1.0
+token_count = 3
+target = 0.01
+prune_threshold = 0.3
+
+[detection]
+llm_judge = false
+
+[display]
+print_responses = false
+print_residual_geometry = false
+plot_residuals = false
+
+non_interactive = true
+
+[benign_prompts]
+dataset = "datasets/good_1000"
+split = "train[:800]"
+column = "prompt"
+
+[target_prompts]
+dataset = "datasets/harmful_1000"
+split = "train[:800]"
+column = "prompt"
+
+[benign_eval_prompts]
+dataset = "datasets/good_1000"
+split = "train[800:900]"
+column = "prompt"
+
+[target_eval_prompts]
+dataset = "datasets/harmful_1000"
+split = "train[800:900]"
+column = "prompt"
