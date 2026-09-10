@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import re
 import shutil
 from pathlib import Path
 
@@ -90,8 +91,8 @@ def main() -> None:
     src = (ROOT / args.config).read_text(encoding="utf-8")
 
     # --- single-trial settings -------------------------------------------
-    src = src.replace("num_trials = 50", "num_trials = 1")
-    src = src.replace("num_warmup_trials = 12", "num_warmup_trials = 0")
+    src = re.sub(r"(?m)^num_trials\s*=\s*\d+", "num_trials = 1", src)
+    src = re.sub(r"(?m)^num_warmup_trials\s*=\s*\d+", "num_warmup_trials = 0", src)
     src = src.replace("refusal_prescreen_enabled = true", "refusal_prescreen_enabled = false")
     src = src.replace(
         f'checkpoint_dir = "{Path(args.checkpoint_dir).name}"',
