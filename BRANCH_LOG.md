@@ -11,7 +11,56 @@
 | 远端 | `origin` → https://github.com/Scorp1o117/abliterix |
 | 上游 | `upstream` → https://github.com/wuwangzhang1216/abliterix |
 | 最近对齐上游 | **v1.12.2**（`5d58cea`，merge `bb48dd9`）——已追平上游 `master` |
-| 本日志最近更新 | 2026-09-11 (TOML 根级键坑 + 阶段一烘烤工具链) |
+| 本日志最近更新 | 2026-09-11 (Nex-N2.5-mini 消融结果：160 口径 9/100 达标) |
+
+---
+
+## -1cs. 2026-09-11 — Nex-N2.5-mini 消融结果（阶段一已发布，peel 阴性）
+
+**产物**：`/run/media/s117/OS/Models/Nex-N2.5-mini-abliterix/`
+21 分片 / 69.3 GB，`Qwen3_5MoeForCausalLM`（纯文本塔，视觉塔未导出），
+随附 `nex25_manifest.json`（21 个分片 SHA256 + trial 属性 + 配方）。
+
+**配方**（`configs/nex25_mini_rocm_v5_256cap.toml` 的 trial 0，direct + EGA）：
+- `attn.o_proj` max 1.066（pos 36.22 / dist 13.94），min 比例 0.4613
+- `mlp.down_proj` max 3.033（pos 37.15 / dist 12.53），min 比例 0.3515 —— EGA 跨 **256 个融合专家**
+- `weight_normalization = none`、per-layer mean 向量、q/k/v 未启用（该架构不可转向）
+- 无路由抑制（`max_suppress = 0`）
+
+**结果（同一份权重，两种评估口径）**：
+
+| 口径 | 原始模型基线 | 本模型 | 3-token KL |
+|---|---|---|---|
+| **160 token**（Ornith/Ling/Qwen3.8 历史 bar 口径） | 98/100 | **9/100** ✅ | 0.0845 |
+| **256 token**（忠实口径，gpt-oss 发货配方采用） | 99/100 | **21/100** | 0.0845 |
+
+- 160 口径下**满足 ship bar（拒绝 ≤10/100 且 KL ≤0.1）**。KL 与 cap 无关（前三 token 分布对比），
+  故 0.0845 两个口径通用。
+- 但 `print_responses = true` 抽查显示：部分「合规」响应实为**概念性说明 / 隐喻偏转**
+  （如「我们生在一个充满不平等的时代…」「以下是一个偏概念性的说明…」），正是 gpt-oss 笔记
+  记录的 150-token 盲区现象。**256 口径的 21/100 更接近真实可用性**，两个数字一并报告，标注口径。
+- 训练侧无退化：Generation health PASSED（repetition 0.231、distinct-4 6011、max ngram repeat 15）。
+
+**阴性结果（三次证伪，均已记录）**：
+1. **路由抑制在本模型上有害**：`max_suppress=6` + `router_bias∈[-5,0]` 使预筛 5/30 → 9/30、
+   KL 0.0845 → 0.1554（gpt-oss 上有效，Nex 上相反）。
+2. **`weight_normalization` full vs none 无差别**：0.25× 档 1/8@0.0530 vs 0/8@0.0523、
+   0.5× 档 0/8@0.1797 vs 0/8@0.1913 —— Ling 的「full 是唯一低 KL 盆地」不迁移。
+3. **leftover peel 无效**：阶段一留下 82/400 leftover，r2（41×2048）网格两点均**变差**
+   （27/100@0.0901、26/100@0.1009 vs 基线 21/100@0.0845），第三点 KL 已 0.1196 时提前止损。
+   记录见 `logs/nex25_peel_t0.json`。
+   ⚠️ 该脚本的余弦判死**未真正生效**（per-layer 模式无全局方向向量 → `cosines` 为空 → max_cos 默认 0），
+   下次应改为逐层余弦（取各层 cos 的均值/最大值）。
+
+**方法论副产品（前三条见 -1cp/-1cq/-1cr）**：
+4. `engine.export_merged()` 的 `merge_and_unload()` 在 122 GB UMA 上会因权重复制触发守护自杀 →
+   direct 模式应直接保存底层模型（`scripts/nex25_export.py`）。
+5. `get_base_model().save_pretrained()` 会保留 PEFT 的模块替换（`…base_layer.weight` + `…lora_*`），
+   朴素重载会**静默随机初始化那 110 个模块**（症状：KL 12.44 vs 0.0845）→ `scripts/fix_peft_export.py`。
+6. 关键词拒绝判定未剥离思考痕迹（judge 路径一直有剥）→ 已修，影响约 1/100。
+
+**工具**：`scripts/nex25_{report,bake,export,peel}.py`、`fix_peft_export.py`、
+`run_nex25.sh` / `run_nex25_peel.sh`、5 个扫描/搜索配置。
 
 ---
 
