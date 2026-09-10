@@ -206,6 +206,13 @@ def main() -> None:
     ap.add_argument("--trial", type=int, required=True, help="stage-1 trial number")
     ap.add_argument("--grid", type=int, default=len(GRID), help="number of grid points to try")
     ap.add_argument("--leftover-n", type=int, default=400, help="target prompts to probe")
+    ap.add_argument(
+        "--contrast",
+        choices=("benign", "opened"),
+        default="benign",
+        help="contrast class for r2: benign prompts (Spark default) or the "
+        "harmful prompts that already comply (leftover-vs-opened)",
+    )
     args = ap.parse_args()
 
     torch.set_grad_enabled(False)
@@ -276,14 +283,18 @@ def main() -> None:
         min_new_tokens=cfg.inference.min_gen_tokens,
     )
     leftover = []
+    opened = []
     prefixes = []
     for msg, text in zip(train_h, texts):
         t = text or ""
         if detector.detect_refusal(t):
             leftover.append(msg)
             prefixes.append(t[:120].replace("\n", "\\n"))
+        else:
+            opened.append(msg)
     print(f"leftover refusals {len(leftover)}/{len(train_h)}", flush=True)
     payload["leftover_n"] = len(leftover)
+    payload["opened_n"] = len(opened)
     payload["leftover_of"] = len(train_h)
     payload["leftover_prefixes_sample"] = prefixes[:10]
     _dump(payload, report)
@@ -293,23 +304,43 @@ def main() -> None:
         print(f"KILL: {payload['kill_reason']}")
         return
 
-    print("extracting leftover-vs-benign residuals for r2...", flush=True)
+    # Contrast class for r2. "benign" reproduces the Spark script (leftover
+    # harmful prompts vs benign prompts). "opened" contrasts the still-refusing
+    # harmful prompts against the harmful prompts that DID comply, which cancels
+    # the generic harmful-vs-benign axis the stage-1 recipe already used and
+    # isolates whatever still drives the residual refusals.
+    if args.contrast == "opened":
+        if len(opened) < 8:
+            payload["kill_reason"] = f"too few opened prompts ({len(opened)}) for contrast"
+            _dump(payload, report)
+            print(f"KILL: {payload['kill_reason']}")
+            return
+        contrast = opened
+        contrast_label = "opened"
+    else:
+        contrast = train_b
+        contrast_label = "benign"
+    payload["contrast"] = contrast_label
+    payload["opened_n"] = len(opened)
+    print(f"extracting leftover-vs-{contrast_label} residuals for r2...", flush=True)
     tgt = engine.extract_hidden_states_batched(leftover)
-    beni = engine.extract_hidden_states_batched(train_b)
+    beni = engine.extract_hidden_states_batched(contrast)
     r2 = compute_configured_steering_vectors(beni, tgt, cfg)
     payload["r2_shape"] = list(r2.shape)
     print(f"r2 vectors {tuple(r2.shape)}", flush=True)
 
     cache = torch.load(STEERING, map_location="cpu", weights_only=False)
-    g = resolve_global_vector(cache["vectors"], artifact.vector_index)
+    stage1 = cache["vectors"]
     cosines = {}
-    if g is not None and r2.ndim == 2:
-        g = g.float()
-        for layer_i in (20, 30, 36, 37, 39):
-            if layer_i < r2.shape[0]:
-                cosines[f"layer_{layer_i}"] = float(
-                    torch.nn.functional.cosine_similarity(g, r2[layer_i].float(), dim=0)
+    if r2.ndim == 2 and stage1.ndim == 2 and stage1.shape == r2.shape:
+        # Per-layer vectors: compare layer by layer. (resolve_global_vector only
+        # exists for global scope, where the old check was silently vacuous.)
+        for layer_i in range(0, r2.shape[0], 8):
+            cosines[f"layer_{layer_i}"] = float(
+                torch.nn.functional.cosine_similarity(
+                    stage1[layer_i].float(), r2[layer_i].float(), dim=0
                 )
+            )
     payload["cosines"] = cosines
     max_cos = max(cosines.values()) if cosines else 0.0
     payload["max_cos"] = max_cos
