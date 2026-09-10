@@ -70,6 +70,26 @@ if not hasattr(_tf_import_utils, "is_torch_fx_available"):
     _tf_import_utils.is_torch_fx_available = lambda: False
 
 
+def extract_router_expert_ids(out: Any, top_k: int = 8) -> Tensor:
+    """Return the top-k expert-id tensor from a MoE router forward.
+
+    Router tuple order is family-specific. Bailing MoE v3 returns
+    ``(topk_idx, topk_weight, logits)`` — indices first — while several
+    other families put indices last. Prefer the first integer tensor
+    instead of a fixed ``out[2]`` slot.
+    """
+    if isinstance(out, tuple) and len(out) >= 3:
+        for cand in out:
+            if isinstance(cand, Tensor) and cand.dtype in (torch.int32, torch.int64):
+                return cand
+        return out[0] if isinstance(out[0], Tensor) else out[1]
+    if isinstance(out, tuple) and len(out) == 2:
+        return out[1]
+    logits = out if not isinstance(out, tuple) else out[0]
+    _, selected = logits.topk(top_k, dim=-1)
+    return selected
+
+
 # Models registered here have a known remote-config mismatch where MTP heads
 # are appended to ``layer_types`` even though ``num_hidden_layers`` describes
 # decoder layers only.  The registry is populated from the model's own
@@ -134,8 +154,17 @@ def _install_mtp_layer_type_validator() -> None:
 _install_mtp_layer_type_validator()
 
 
+# Cap the dequantised-weight cache so large MoE expert counts cannot retain
+# hundreds of GB of fp32 copies in RAM.  Shared by SteeringEngine.__init__ and
+# the fast vLLM engine shell in cli.py so the two cannot drift apart.
+DEQUANT_CACHE_MAX_BYTES = 4 * 1024**3  # 4 GiB
+
+
 def resolve_model_class(
     model_id: str,
+    revision: str | None = None,
+    *,
+    text_only: bool = False,
 ) -> Type[AutoModelForImageTextToText] | Type[AutoModelForCausalLM]:
     """Choose the correct AutoModel class based on the model's configuration.
 
@@ -143,28 +172,41 @@ def resolve_model_class(
     ``AutoModelForImageTextToText``; their text backbone is accessed via the
     ``model.language_model`` path in ``transformer_layers``.  Pure text models
     use ``AutoModelForCausalLM``.
-    """
-    configs = PretrainedConfig.get_config_dict(model_id)
-    config_dicts = configs if isinstance(configs, tuple) else (configs,)
-    config = config_dicts[0]
 
-    # Agents-A1 / Qwen3.5-MoE exposes multimodal config fields, but Abliterix
-    # steers only the language model. Loading it through ImageTextToText adds
-    # unnecessary vision wrapper plumbing and can break local-only text runs.
-    if config.get("model_type") == "qwen3_5_moe":
+    When *text_only* is true, always return ``AutoModelForCausalLM`` even if
+    the checkpoint advertises multimodal fields (opt-in for text abliteration
+    of dual-registered MoE VLMs such as some Qwen3.5-MoE checkpoints).
+    """
+    configs = PretrainedConfig.get_config_dict(model_id, revision=revision)
+    if text_only:
         return AutoModelForCausalLM
 
-    # Flash-Next is a VL wrapper around the text MoE. Abliterix steers only
-    # the language model; ImageTextToText is still required so AutoConfig
-    # binds Qwen4ExpForConditionalGeneration.
-    if any("vision_config" in cfg for cfg in config_dicts if isinstance(cfg, dict)):
+    config_dicts = configs if isinstance(configs, tuple) else (configs,)
+
+    if any(isinstance(cfg, dict) and "vision_config" in cfg for cfg in config_dicts):
         return AutoModelForImageTextToText
     return AutoModelForCausalLM
+
+
+def _bf16_compute_supported() -> bool:
+    """True when the active accelerator has native (non-emulated) bf16.
+
+    ``torch.cuda.is_bf16_supported()`` defaults to including software
+    emulation, so pre-Ampere CUDA cards still return True. We only treat
+    ROCm and sm_80+ as native bf16 so older CUDA targets can fall back to
+    float16 for both bnb compute dtype and residual promotion.
+    """
+    if not torch.cuda.is_available():
+        return False
+    if torch.version.hip:  # ROCm: native on supported archs
+        return True
+    return torch.cuda.get_device_capability()[0] >= 8
 
 
 def _register_mtp_layer_types_adapter(
     model_id: str,
     trust_remote_code: bool | None,
+    revision: str | None = None,
 ) -> None:
     """Register models whose ``layer_types`` includes MTP head layers.
 
@@ -181,6 +223,7 @@ def _register_mtp_layer_types_adapter(
         cfgs = PretrainedConfig.get_config_dict(
             model_id,
             trust_remote_code=trust_remote_code,
+            revision=revision,
         )
         cfg_dict = cfgs[0] if isinstance(cfgs, tuple) else cfgs
         layer_types = cfg_dict.get("layer_types")
@@ -203,11 +246,13 @@ def _register_mtp_layer_types_adapter(
 def load_tokenizer(
     model_id: str,
     trust_remote_code: bool | None = None,
+    revision: str | None = None,
 ) -> PreTrainedTokenizerBase:
     try:
         return AutoTokenizer.from_pretrained(
             model_id,
             trust_remote_code=trust_remote_code,
+            revision=revision,
         )
     except AttributeError as exc:
         if "'list' object has no attribute 'keys'" not in str(exc):
@@ -216,14 +261,15 @@ def load_tokenizer(
         return AutoTokenizer.from_pretrained(
             model_id,
             trust_remote_code=trust_remote_code,
+            revision=revision,
             extra_special_tokens={},
         )
     except ValueError as exc:
         if "TokenizersBackend" not in str(exc):
             raise
 
-        cfg_path = hf_hub_download(model_id, "tokenizer_config.json")
-        tok_path = hf_hub_download(model_id, "tokenizer.json")
+        cfg_path = hf_hub_download(model_id, "tokenizer_config.json", revision=revision)
+        tok_path = hf_hub_download(model_id, "tokenizer.json", revision=revision)
         with open(cfg_path, encoding="utf-8") as f:
             cfg = json.load(f)
 
@@ -415,7 +461,9 @@ class SteeringEngine:
         self.needs_reload = False
         self._dequant_cache: dict[int, Tensor] = {}
         self._dequant_cache_bytes: int = 0
-        self._dequant_cache_max_bytes: int = 4 * 1024**3  # 4 GB
+        # Cap dequant cache so large MoE expert counts cannot retain
+        # hundreds of GB of fp32 weights in RAM.
+        self._dequant_cache_max_bytes: int = DEQUANT_CACHE_MAX_BYTES
 
         # Cached metadata — populated by prepare_for_unload() before the HF
         # model is freed, so the optimizer can still query layer/component
@@ -433,11 +481,13 @@ class SteeringEngine:
         _register_mtp_layer_types_adapter(
             model_id,
             config.model.trust_remote_code,
+            config.model.revision,
         )
 
         self.tokenizer = load_tokenizer(
             model_id,
             trust_remote_code=config.model.trust_remote_code,
+            revision=config.model.revision,
         )
 
         # Tokenizers that lack a dedicated pad token fall back to EOS.
@@ -495,7 +545,11 @@ class SteeringEngine:
         try:
             from transformers import AutoConfig as _AC
 
-            _auto_cfg = _AC.from_pretrained(model_id, trust_remote_code=True)
+            _auto_cfg = _AC.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                revision=config.model.revision,
+            )
             _qcfg = getattr(_auto_cfg, "quantization_config", None)
             if _qcfg is None:
                 _text_cfg = getattr(_auto_cfg, "text_config", None)
@@ -567,13 +621,13 @@ class SteeringEngine:
         # AttributeError during replace_with_fp8_linear. Patch the config class
         # to alias intermediate_size → moe_intermediate_size if needed.
         if is_fp8:
-            self._patch_moe_config_for_fp8(model_id)
+            self._patch_moe_config_for_fp8(model_id, config.model.revision)
 
         for dtype in config.model.dtype_fallback_order:
             print(f"* Trying dtype [bold]{dtype}[/]... ", end="")
 
             try:
-                qconfig = self._build_quant_config(dtype)
+                qconfig = self._build_quant_config()
 
                 extra: dict[str, Any] = {}
                 if qconfig is not None:
@@ -730,6 +784,24 @@ class SteeringEngine:
         if self.model is None:
             raise RuntimeError("Failed to load model with all configured dtypes.")
 
+        # bnb 4-bit: non-quantized tensors (embed/norm/lm_head) may still be
+        # float16 after load (including dtype="auto" when the checkpoint is
+        # float16). When native bf16 is available, promote live float16 params
+        # so residual norms match the bf16 compute path. Skip promotion when
+        # we fell back to float16 compute (pre-Ampere CUDA). Parameters on
+        # meta (accelerate offload) may not retain this.
+        if (
+            config.model.quant_method == QuantMode.BNB_4BIT
+            and _bf16_compute_supported()
+        ):
+            n_conv = 0
+            for _n, _p in self.model.named_parameters():
+                if _p.dtype == torch.float16:
+                    _p.data = _p.data.to(torch.bfloat16)
+                    n_conv += 1
+            if n_conv:
+                print(f"  [dim]Promoted {n_conv} non-quantized params fp16→bf16[/]")
+
         # NOTE: FP8 dequant is now applied inside the dtype loop (above),
         # before the smoke-test, so we no longer need it here.
 
@@ -823,12 +895,17 @@ class SteeringEngine:
                     model_id, device_map, self.max_memory
                 )
                 print("  [dim]qwen4exp: n-gram modules pinned to CPU in device_map[/]")
-            model = resolve_model_class(model_id).from_pretrained(
+            model = resolve_model_class(
+                model_id,
+                self.config.model.revision,
+                text_only=self.config.model.text_only,
+            ).from_pretrained(
                 model_id,
                 **{_dtype_kwarg: dtype},
                 device_map=device_map,
                 max_memory=self.max_memory,
                 trust_remote_code=self.trusted_models.get(model_id),
+                revision=self.config.model.revision,
                 offload_folder="/tmp/offload",
                 **extra,
             )
@@ -842,10 +919,15 @@ class SteeringEngine:
         print("  [dim]fast load: mmap -> per-storage CUDA (no 2× CPU copy)[/]")
         extra = {**extra}
         extra.setdefault("low_cpu_mem_usage", True)
-        model = resolve_model_class(model_id).from_pretrained(
+        model = resolve_model_class(
+            model_id,
+            self.config.model.revision,
+            text_only=self.config.model.text_only,
+        ).from_pretrained(
             model_id,
             **{_dtype_kwarg: dtype},
             trust_remote_code=self.trusted_models.get(model_id),
+            revision=self.config.model.revision,
             **extra,
         )
         # Stream unique storages to GPU and drop the CPU/mmap alias so a
@@ -883,12 +965,17 @@ class SteeringEngine:
         ``"auto"`` (explicit maps/offload keep the accelerate path).
         """
         if self.config.model.device_map != "auto":
-            return resolve_model_class(model_id).from_pretrained(
+            return resolve_model_class(
+                model_id,
+                self.config.model.revision,
+                text_only=self.config.model.text_only,
+            ).from_pretrained(
                 model_id,
                 **{_dtype_kwarg: dtype},
                 device_map=self.config.model.device_map,
                 max_memory=self.max_memory,
                 trust_remote_code=self.trusted_models.get(model_id),
+                revision=self.config.model.revision,
                 offload_folder="/tmp/offload",
                 **extra,
             )
@@ -905,10 +992,15 @@ class SteeringEngine:
         # this loader quantizes manually.
         extra.pop("quantization_config", None)
 
-        model = resolve_model_class(model_id).from_pretrained(
+        model = resolve_model_class(
+            model_id,
+            self.config.model.revision,
+            text_only=self.config.model.text_only,
+        ).from_pretrained(
             model_id,
             dtype="bfloat16",
             trust_remote_code=self.trusted_models.get(model_id),
+            revision=self.config.model.revision,
             device_map=None,
             low_cpu_mem_usage=True,
             **extra,
@@ -1261,7 +1353,7 @@ class SteeringEngine:
         )
 
     @staticmethod
-    def _patch_moe_config_for_fp8(model_id: str) -> None:
+    def _patch_moe_config_for_fp8(model_id: str, revision: str | None = None) -> None:
         """Patch MoE config classes that lack ``intermediate_size``.
 
         The transformers FP8 quantizer (``finegrained_fp8.py``) falls back to
@@ -1276,7 +1368,9 @@ class SteeringEngine:
         from transformers import AutoConfig
 
         try:
-            auto_cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+            auto_cfg = AutoConfig.from_pretrained(
+                model_id, trust_remote_code=True, revision=revision
+            )
             text_cfg = getattr(auto_cfg, "text_config", auto_cfg)
             cfg_cls = type(text_cfg)
 
@@ -1293,11 +1387,16 @@ class SteeringEngine:
         except Exception:
             pass  # Best-effort; if this fails, the original error will surface.
 
-    def _build_quant_config(self, dtype: str) -> BitsAndBytesConfig | None:
+    def _build_quant_config(self) -> BitsAndBytesConfig | None:
         """Translate the user-facing QuantMode into a BitsAndBytesConfig."""
         qm = self.config.model.quant_method
         if qm == QuantMode.BNB_4BIT:
-            compute_dtype = torch.bfloat16
+            # Prefer native bf16 compute for residual dynamic range; fall back
+            # to float16 on pre-Ampere CUDA (and CPU). Does not control which
+            # modules are quantized — only matmul compute dtype.
+            compute_dtype = (
+                torch.bfloat16 if _bf16_compute_supported() else torch.float16
+            )
             return BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=compute_dtype,
@@ -1564,6 +1663,7 @@ class SteeringEngine:
         # anything left here pins the model's VRAM after
         # ``engine.model = None`` (issue #83).
         self._dequant_cache.clear()
+        self._dequant_cache_bytes = 0
         for handle in getattr(self, "_angular_hooks", []):
             handle.remove()
         self._angular_hooks = []
@@ -1679,30 +1779,9 @@ class SteeringEngine:
         def _make_hook(layer_idx: int):
             def hook(module: Module, inp: Any, out: Any):
                 with torch.no_grad():
-                    if isinstance(out, tuple) and len(out) >= 3:
-                        # Router output order varies by MoE family:
-                        # Bailing v3 returns (topk_idx, topk_weight, logits)
-                        # — indices FIRST — while other families return
-                        # (weights, indices, ...) with indices last. Pick
-                        # the first integral tensor as the expert-id tensor.
-                        selected = None
-                        for cand in out:
-                            if isinstance(cand, torch.Tensor) and cand.dtype in (
-                                torch.int32,
-                                torch.int64,
-                            ):
-                                selected = cand
-                                break
-                        if selected is None:
-                            selected = (
-                                out[0] if isinstance(out[0], torch.Tensor) else out[1]
-                            )
-                    elif isinstance(out, tuple) and len(out) == 2:
-                        selected = out[1]
-                    else:
-                        logits = out if not isinstance(out, tuple) else out[0]
-                        k = getattr(module, "top_k", 8)
-                        _, selected = logits.topk(k, dim=-1)
+                    selected = extract_router_expert_ids(
+                        out, top_k=getattr(module, "top_k", 8)
+                    )
 
                     flat = selected.reshape(-1)
                     k = getattr(module, "top_k", selected.shape[-1])
@@ -1710,19 +1789,20 @@ class SteeringEngine:
 
                     active_tokens[0][layer_idx] += n_tok
                     cnts = active_counts[0][layer_idx]
-                    # Batch-count every expert in one bincount instead of
-                    # per-expert (flat == eid) GPU syncs — the per-expert
-                    # loop is catastrophically slow on 512-expert MoEs
-                    # (profiling was taking 2+ hours vs minutes).
-                    _w = getattr(module, "weight", None)
-                    if _w is not None:
-                        n_experts = _w.shape[0]
-                    else:
-                        n_experts = int(flat.max().item()) + 1
-                    bc = torch.bincount(flat.long(), minlength=n_experts).cpu().tolist()
-                    for eid, c in enumerate(bc):
-                        if c:
-                            cnts[eid] += c
+                    # One bincount instead of per-expert (flat == eid) GPU
+                    # syncs — the loop is catastrophically slow on 512-expert
+                    # MoEs (hours vs minutes).
+                    weight = getattr(module, "weight", None)
+                    n_experts = (
+                        weight.shape[0]
+                        if weight is not None
+                        else int(flat.max().item()) + 1
+                    )
+                    for eid, count in enumerate(
+                        torch.bincount(flat.long(), minlength=n_experts).cpu().tolist()
+                    ):
+                        if count:
+                            cnts[eid] += count
 
             return hook
 
@@ -1810,7 +1890,7 @@ class SteeringEngine:
         self.model = None  # ty:ignore[invalid-assignment]
         flush_memory()
 
-        qconfig = self._build_quant_config(str(dtype).split(".")[-1])
+        qconfig = self._build_quant_config()
         extra: dict[str, Any] = {}
         if qconfig is not None:
             extra["quantization_config"] = qconfig
@@ -1892,11 +1972,16 @@ class SteeringEngine:
             }
 
             print("* Loading base model on CPU (this may take a while)...")
-            base = resolve_model_class(self.config.model.model_id).from_pretrained(
+            base = resolve_model_class(
+                self.config.model.model_id,
+                self.config.model.revision,
+                text_only=self.config.model.text_only,
+            ).from_pretrained(
                 self.config.model.model_id,
                 **{_dtype_kwarg: self.model.dtype},
                 device_map="cpu",
                 trust_remote_code=self.trusted_models.get(self.config.model.model_id),
+                revision=self.config.model.revision,
             )
 
             print("* Applying LoRA adapters...")
@@ -1912,6 +1997,15 @@ class SteeringEngine:
             merged = self.model.merge_and_unload()
             self.needs_reload = True
             return merged
+
+    def _cache_dequant(self, mid: int, weight: Tensor) -> None:
+        """Store a dequantized weight tensor if under the byte budget.
+
+        Pure performance cache: skipping an insert only costs re-dequant time.
+        """
+        if self._dequant_cache_bytes < self._dequant_cache_max_bytes:
+            self._dequant_cache[mid] = weight
+            self._dequant_cache_bytes += weight.nelement() * weight.element_size()
 
     def export_adapter(self, save_directory: str | os.PathLike[str]) -> None:
         """Save the active LoRA adapter without BF16 merge-rounding drift.
@@ -1936,6 +2030,21 @@ class SteeringEngine:
             )
         if not isinstance(self.model, PeftModel):
             raise RuntimeError("No active PEFT LoRA adapter is available to export.")
+        # `export_merged()` calls `merge_and_unload()` in place on the
+        # unquantized path: the LoRA layers are folded into the base weights
+        # and removed, but `self.model` stays a PeftModel object.  The
+        # isinstance check above therefore still passes and PEFT would happily
+        # write a zero-tensor adapter.  `needs_reload` is the engine's
+        # canonical "weights were destructively mutated" flag; the state-dict
+        # check also covers any other route to an emptied adapter.
+        if self.needs_reload or not any(
+            "lora_" in name for name, _ in self.model.named_parameters()
+        ):
+            raise RuntimeError(
+                "The in-memory LoRA adapter was consumed by a previous merged "
+                "export. Re-select the trial to reload the base model before "
+                "exporting an adapter."
+            )
 
         self.model.save_pretrained(save_directory)
 

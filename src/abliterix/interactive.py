@@ -25,6 +25,7 @@ from .eval.scorer import TrialScorer
 from .optimizer import run_search
 from .reproducibility import (
     REPRODUCE_TAG,
+    assess_reproducibility,
     build_manifest,
     repo_weight_shas,
     write_reproduce_artifacts,
@@ -71,8 +72,13 @@ def ask_merge_strategy(config: AbliterixConfig, engine: SteeringEngine) -> str |
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                meta = resolve_model_class(config.model.model_id).from_pretrained(
+                meta = resolve_model_class(
                     config.model.model_id,
+                    config.model.revision,
+                    text_only=config.model.text_only,
+                ).from_pretrained(
+                    config.model.model_id,
+                    revision=config.model.revision,
                     device_map="meta",
                     torch_dtype=torch.bfloat16,
                     trust_remote_code=True,
@@ -149,7 +155,6 @@ def _save_model_locally(config: AbliterixConfig, engine: SteeringEngine):
     print(f"Model saved to [bold]{save_dir}[/].")
 
 
-
 def _save_lora_adapter_locally(config: AbliterixConfig, engine: SteeringEngine):
     """Save only the PEFT LoRA adapter and tokenizer files."""
     save_dir = ask_path("Path to the adapter folder:")
@@ -157,11 +162,9 @@ def _save_lora_adapter_locally(config: AbliterixConfig, engine: SteeringEngine):
         return
 
     print("Saving LoRA adapter only...")
-    # Route through export_adapter() so the empty-adapter guard (PR #95,
-    # f540863) runs: after a merged export consumed the LoRA layers,
-    # self.model is a PeftModel shell with zero lora_ params and a bare
-    # save_pretrained() would silently write an empty adapter file.
     try:
+        # Use the guarded export path (rejects non-LoRA, router/expert base
+        # edits, and non-PeftModel backends such as bare vLLM HF shells).
         engine.export_adapter(save_dir)
     except RuntimeError as error:
         print(f"[red]{error}[/]")
@@ -226,8 +229,19 @@ def _upload_model(
             "uncensored",
             "decensored",
             "abliterated",
-            REPRODUCE_TAG,
         ]
+        reproducible, reasons = assess_reproducibility(config)
+        if trial.user_attrs.get("steering_recipe") is None:
+            reproducible = False
+            reasons.append("the winning trial has no exact steering recipe")
+        if reproducible:
+            card.data.tags.append(REPRODUCE_TAG)
+        else:
+            print(
+                "[yellow]Model is not tagged reproducible: "
+                + "; ".join(reasons)
+                + "[/]"
+            )
         card.text = (
             generate_model_card(
                 config,

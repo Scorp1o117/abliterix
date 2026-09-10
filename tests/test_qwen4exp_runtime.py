@@ -261,6 +261,8 @@ def test_bnb_recipe_load_path_pins_ngram(monkeypatch):
             device_map="auto",
             quant_method=QuantMode.BNB_4BIT,
             trust_remote_code=None,
+            revision=None,
+            text_only=False,
         )
     )
     engine.max_memory = {0: "64GB", "cpu": "24GB"}
@@ -312,6 +314,10 @@ def test_export_adapter_succeeds_for_lora(monkeypatch, tmp_path):
             self.saved_to = None
             self.config = SimpleNamespace(model_type="qwen4_exp")
 
+        def named_parameters(self):
+            # Upstream's empty-adapter guard requires a live lora_ parameter.
+            yield "base_model.model.layers.0.o_proj.lora_A.default.weight", object()
+
         def save_pretrained(self, path):
             self.saved_to = path
 
@@ -324,6 +330,7 @@ def test_export_adapter_succeeds_for_lora(monkeypatch, tmp_path):
     engine.model = FakePeftModel()
     engine._router_originals = []
     engine._expert_deltas = []
+    engine.needs_reload = False
 
     engine.export_adapter(tmp_path)
     assert engine.model.saved_to == tmp_path

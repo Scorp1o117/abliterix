@@ -66,11 +66,27 @@ class ModelConfig(BaseModel):
 
     model_id: str = Field(description="Hugging Face model identifier or local path.")
 
+    revision: str | None = Field(
+        default=None,
+        description=(
+            "Hugging Face model revision. Reproducible runs resolve this to an "
+            "immutable 40-character commit SHA before loading."
+        ),
+    )
+
     evaluate_model_id: str | None = Field(
         default=None,
         description=(
             "When set, the system evaluates this model against the primary model "
             "rather than running the optimisation loop."
+        ),
+    )
+
+    evaluate_model_revision: str | None = Field(
+        default=None,
+        description=(
+            "Immutable Hugging Face revision for evaluate_model_id. Resolved "
+            "automatically when evaluation-only mode uses a Hub model."
         ),
     )
 
@@ -110,6 +126,16 @@ class ModelConfig(BaseModel):
     trust_remote_code: bool | None = Field(
         default=None,
         description="Whether to trust remote code shipped with the model.",
+    )
+
+    text_only: bool = Field(
+        default=False,
+        description=(
+            "Force AutoModelForCausalLM even when the checkpoint advertises "
+            "multimodal config fields (e.g. some Qwen3.5-MoE / Agents checkpoints). "
+            "Use for text-only abliteration; leave false to preserve the default "
+            "ImageTextToText path for VLMs."
+        ),
     )
 
     attn_implementation: str | None = Field(
@@ -560,7 +586,7 @@ class SteeringConfig(BaseModel):
     )
 
     orthogonal_projection: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Remove the benign-direction component from steering vectors so that "
             "only the genuinely safety-specific signal is subtracted."
@@ -1116,7 +1142,7 @@ class SteeringConfig(BaseModel):
     )
 
     weight_normalization: WeightNorm = Field(
-        default=WeightNorm.NONE,
+        default=WeightNorm.FULL,
         description=(
             "Row-norm handling for weight matrices.  "
             '"none" applies steering directly, '
@@ -1920,6 +1946,7 @@ class DetectionConfig(BaseModel):
             "inappropriate",
             "unethical",
             "ethical boundaries",
+            "disclaimer",
             # Chinese — apology / regret
             "抱歉",
             "对不起",
@@ -1965,10 +1992,11 @@ class DetectionConfig(BaseModel):
     )
 
     llm_judge: bool = Field(
-        default=True,
+        default=False,
         description="Route every response through an external LLM judge over an "
-        "OpenAI-compatible chat/completions API. "
-        "Set to False to use keyword matching as a fallback when no API key is available.",
+        "OpenAI-compatible chat/completions API. Disabled by default so ordinary "
+        "runs remain offline, deterministic, and independently reproducible. "
+        "Enable it for semantic audits; credentials are validated before model loading.",
     )
 
     llm_judge_model: str = Field(
@@ -2369,6 +2397,15 @@ class AbliterixConfig(BaseSettings):
         description="Batch mode — skip interactive prompts and exit after the search loop.",
     )
 
+    non_interactive_output_dir: str | None = Field(
+        default=None,
+        description=(
+            "Optional empty output directory for batch mode. The best completed "
+            "trial is replayed exactly, exported, hashed, and accompanied by a "
+            "reproduce/ manifest suitable for independent CI verification."
+        ),
+    )
+
     overwrite_checkpoint: bool = Field(
         default=False,
         description=(
@@ -2535,6 +2572,18 @@ class AbliterixConfig(BaseSettings):
                     "response_pair_enabled=true is incompatible with iterative/RDO "
                     "extraction."
                 )
+        # HF can materialize the stability-first FULL row-norm default. The
+        # vLLM projection cache cannot; when the user did not explicitly pick
+        # a mode, use PRE (the strongest supported normalization) instead.
+        # An explicit vLLM+FULL request still fails below rather than silently
+        # changing the requested algorithm.
+        if (
+            self.model.backend == "vllm"
+            and self.steering.weight_normalization == WeightNorm.FULL
+            and "weight_normalization" not in self.steering.model_fields_set
+        ):
+            self.steering.weight_normalization = WeightNorm.PRE
+
         # Iterative path passes its own n_directions and does not forward the
         # harmfulness flag — combining them would silently drop the harmfulness
         # signal. Reject explicitly so the misconfiguration surfaces at config

@@ -759,6 +759,8 @@ def run_search(
                     config.steering.concept_gate_threshold = (
                         original_concept_gate_threshold
                     )
+            # Return freed VRAM between trials so long Optuna runs on large MoE
+            # models do not accumulate allocator fragmentation.
             flush_memory()
 
     # ----------------------------------------------------------------

@@ -79,9 +79,13 @@ def running_in_notebook() -> bool:
 
 
 def _stdin_is_tty() -> bool:
-    # Both stdin AND stdout must be TTYs for questionary/prompt_toolkit to
-    # render correctly. Under `abliterix | tee`, stdout is a pipe (not a
-    # TTY) so we fall back to the numeric menu.
+    """True when interactive prompts can render (stdin and stdout are TTYs).
+
+    Under pipelines such as ``abliterix | tee``, stdout is not a TTY and
+    prompt_toolkit/questionary often misbehaves; fall back to a numeric menu.
+    """
+    import sys
+
     try:
         return sys.stdin.isatty() and sys.stdout.isatty()
     except Exception:
@@ -113,6 +117,12 @@ def ask_choice(message: str, choices: list[Any]) -> Any:
                 print(f"[red]Please enter a number between 1 and {len(real)}[/]")
             except ValueError:
                 print("[red]Invalid input. Please enter a number.[/]")
+            except (KeyboardInterrupt, EOFError):
+                # questionary's .ask() returns None when the user aborts;
+                # callers treat that as "go back one menu". Match it here so
+                # a redirected stdout does not turn Ctrl-C into a hard exit.
+                print()
+                return None
     else:
         return questionary.select(
             message,
@@ -130,7 +140,16 @@ def ask_text(
     if running_in_notebook() or not _stdin_is_tty():
         print()
         prompt = f"{message} [{default}]: " if default else f"{message}: "
-        result = input(prompt)
+        try:
+            result = input(prompt)
+        except (KeyboardInterrupt, EOFError):
+            # `unsafe=True` callers (the chat loop) expect the interrupt to
+            # propagate, exactly like questionary's unsafe_ask(); everyone
+            # else expects the None that .ask() returns on abort.
+            if unsafe:
+                raise
+            print()
+            return None  # ty:ignore[invalid-return-type]
         return result if result else default
     else:
         q = questionary.text(message, default=default, qmark=qmark)
@@ -138,16 +157,20 @@ def ask_text(
 
 
 def ask_path(message: str) -> str:
-    if running_in_notebook():
+    if running_in_notebook() or not _stdin_is_tty():
         return ask_text(message)
     else:
         return questionary.path(message, only_directories=True).ask()
 
 
 def ask_secret(message: str) -> str:
-    if running_in_notebook():
+    if running_in_notebook() or not _stdin_is_tty():
         print()
-        return getpass.getpass(message)
+        try:
+            return getpass.getpass(message)
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return None  # ty:ignore[invalid-return-type]
     else:
         return questionary.password(message).ask()
 
