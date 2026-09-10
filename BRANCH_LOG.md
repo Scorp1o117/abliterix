@@ -10,8 +10,48 @@
 | 分支名 | `sc117-base` |
 | 远端 | `origin` → https://github.com/Scorp1o117/abliterix |
 | 上游 | `upstream` → https://github.com/wuwangzhang1216/abliterix |
-| 最近对齐上游 | **v1.12.1**（`76a7a31`，merge `09c6e53`）；上游 `master` 已前进到 `05c3e87`，尚未再 merge |
-| 本日志最近更新 | 2026-09-06 (Spark-X2.5-1.7B V1–V4 搜索 + V30 T615 bake) |
+| 最近对齐上游 | **v1.12.2**（`5d58cea`，merge `bb48dd9`）——已追平上游 `master` |
+| 本日志最近更新 | 2026-09-10 (对齐上游 v1.12.2 + WIP 入库) |
+
+---
+
+## -1co. 2026-09-10 — 对齐上游 v1.12.2（merge `bb48dd9`）
+
+**上游新增**：PR #95（bnb-ROCm MoE 稳定性 + `text_only` + 空 adapter 守卫）、#97/#98（固定续写 EOS、
+数学文档）、#99（稳定性/可复现性：reproduce manifest 回放）、#100（版本 1.12.2）、#101/#102（手动发布 CI）、
+#103（Bailing v3 可转向模块）、#104（MoE router 专家 id 探测）、#105（视频提示词数据集生成器），
+另加 `SAFETY.md` / `SECURITY.md`。本 fork 的三个 PR 分支（`pr/bnb-rocm-moe-stability`、
+`pr/bailing-steerable-modules`、`pr/moe-router-profiling`）**已全部被上游合并**，本地分支可清理。
+上游新增主依赖 `openai>=2,<3`（已装入 `heretic-env`）。
+
+**冲突解决（9 文件 / 21 处）**：
+- `engine.resolve_model_class`：**跟随上游契约**——移除 fork 的 `model_type == "qwen3_5_moe"` 隐式识别，
+  统一改用 `model.text_only = true` 显式开关（上游新增测试 `tests/test_bnb_moe_load_fixes.py` 锁死该契约）。
+  ⚠️ **行为变化**：`qwen3_5_moe` **且带视觉塔**的检查点（本机 `Nex-N2.5-mini`、
+  `Ornith-1.5-35B-A3B-Heretic-t62`）默认重新走 ImageTextToText；要保留旧的纯文本加载，
+  请在对应 config 里加 `text_only = true`（Agents-A1 / Qwen3.5-122B/397B 的 config 若仍要跑，同理）。
+- `engine._load_model_fast` / `_load_model_bnb_fast`：**保留 fork 的 ROCm 快速加载**
+  （CPU mmap → 按 storage 上卡，避免 67G MoE 峰值 2×），并把上游新增的 `revision` / `text_only`
+  透传进 4 处 `resolve_model_class` 调用与 4 处 `from_pretrained`。
+- `optimizer`：保留 fork 的 `runtime_hook_site` / `concept_gate_threshold` 还原 × 上游 `flush_memory` 注释。
+- `settings`：fork 的 `response_pair_enabled` 校验 × 上游的 vLLM+FULL→PRE 回退，两者并存。
+- `util` / `interactive` / `safex` / `steering`：取上游（docstring、TTY 中断兜底、
+  `extract_router_expert_ids` 共享探测、`_cache_dequant` 缓存上限）。
+- `cli`：`owner/model` 简写条件取上游 `len(sys.argv) == 2`（fork 版多参数时会把 `--model.model-id`
+  插到别的选项值前面）；fork 的 failure-conditioned 变体 × 上游 reproduce 回放做**语义合并**，
+  回放块插到 `study` 执行之前（否则会重复跑搜索）。
+- `uv.lock`：版本 1.12.2。
+
+**顺带修复**：
+- `tests/test_runtime_hook_sites.py`：WIP 中误插的孤立 `)` 让整个文件无法解析（测试收集直接中断），已修。
+- `tests/test_qwen4exp_runtime.py`：假 config 补 `revision` / `text_only`，补 `needs_reload = False`
+  与 `FakePeftModel.named_parameters()`，适配上游新守卫。
+
+**验证（同基线对照）**：`heretic-env` 跑全量 `pytest tests/`，
+基线 26 failed / 913 passed → 合并后 26 failed / **952 passed**，**零回归**、新增 39 个通过用例。
+剩余 26 个失败与本次合并无关：peft `0.19.1` vs pyproject `peft~=0.18` 的 API 漂移（8 个）、
+fork 自测替身缺 `use_cache` / `concept_gate_refusal_prefix_retry` 等新字段（14 个）、
+`test_detector` 正则（2 个）、需本地 Flash-Next 权重（2 个）。
 
 ---
 
