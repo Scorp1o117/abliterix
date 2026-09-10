@@ -93,11 +93,14 @@ def _cfg() -> AbliterixConfig:
     os.environ["AX_CONFIG"] = CONFIG
     sys.argv = ["nex25_peel", "--config", CONFIG, "--seed", "117"]
     cfg = AbliterixConfig()
-    cfg.model.model_id = str(STAGE1)
+    # model_id stays on the original base here: apply_trial_artifact() verifies
+    # that the trial was optimised for the configured base model. It is switched
+    # to the baked stage-1 checkpoint right after that check.
     cfg.model.text_only = True
     cfg.optimization.checkpoint_dir = "checkpoints_nex25_mini_peel"
-    cfg.inference.batch_size = min(cfg.inference.batch_size, 32)
-    cfg.inference.max_batch_size = min(cfg.inference.max_batch_size, 64)
+    # The v5 search ran this model at batch 128 under the same UMA guard, so the
+    # peel keeps the config's batch size rather than throttling it (a 4x slower
+    # eval makes six grid points take hours).
     cfg.detection.llm_judge = False
     cfg.steering.n_directions = 1
     return cfg
@@ -226,7 +229,8 @@ def main() -> None:
     cfg = _cfg()
     trial = load_trial(CHECKPOINT, BASE_MODEL, args.trial)
     artifact = extract_trial_artifact(trial)
-    apply_trial_artifact(cfg, artifact)
+    apply_trial_artifact(cfg, artifact)  # provenance check against the base
+    cfg.model.model_id = str(STAGE1)     # now load the baked stage-1 weights
     payload["stage1_attrs"] = {
         "refusals": trial.user_attrs.get("refusals"),
         "kl": trial.user_attrs.get("kl_divergence"),
