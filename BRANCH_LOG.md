@@ -11,7 +11,54 @@
 | 远端 | `origin` → https://github.com/Scorp1o117/abliterix |
 | 上游 | `upstream` → https://github.com/wuwangzhang1216/abliterix |
 | 最近对齐上游 | **v1.12.2**（`5d58cea`，merge `bb48dd9`）——已追平上游 `master` |
-| 本日志最近更新 | 2026-09-11 (口径纠正 160 + q/k/v 陷阱 + 变换 A/B) |
+| 本日志最近更新 | 2026-09-11 (判别层选择降 27% KL；harmfulness_pair 致命不兼容) |
+
+---
+
+## -1cu. 2026-09-11 — calib2/v7：判别层选择是有效杠杆，方向变体在 EGA 下不可用
+
+### (a) `discriminative_layer_selection` —— 有效，已入配方
+
+同类层只对「有害/无害激活沿转向向量投影方向相反」的层施加编辑，其余层跳过。
+calib2 在 0.25× 同强度下 A/B（160 口径）：
+
+| 配方 | 拒绝 | KL |
+|---|---|---|
+| 全层（基线） | **12**/100 | 0.0594 |
+| **+ 判别层选择** | 17/100 | **0.0434** |
+
+读法：**KL 降 27% 但拒绝升 5** —— 不是白赚，是沿权衡曲线移动；**但在等 KL 下确实更优**
+（KL≈0.044 处：判别层 17/100 vs 均匀曲线 20/100，净赚 3 个拒绝）。故纳入 v7 配方。
+
+⚠️ 实现侧注意：`discriminative_layer_selection` 是**配置级**（每次 `apply_steering` 内调用
+`_detect_discriminative_layers(benign_states, target_states, config)`），不是 trial 参数，
+所以同一 run 内无法与「全层」对照——对照必须跨 run 做。
+
+### (b) `search_harmfulness_direction` —— direct+MoE 下致命，永久关闭
+
+双方向（`harmfulness_pair`）变体触发：
+
+```
+ValueError: Multi-direction direct MoE steering is not yet supported:
+the EGA expert path accepts one direction per layer. Use a single direction
+or LoRA without expert routing.
+```
+
+而且它**会把整个 run 带崩**（不只是那个 trial 记为 FAIL）——calib2 因此中断。
+在 EGA 一方向/层的限制解除前，方向配方这条路不可用。
+
+### (c) 其他杠杆状态
+
+- `direct_transform`：orba 15/100、biprojected 19/100 vs standard 12/100（同强度）→ 固定 standard。
+- `vector_method`：仍有 8 种未试（pca / cosmic / sra / som / sae / rdo / optimal_transport /
+  median_of_means）；主人的 Spark 经验里这些多为阴性，列为后续候选。
+- `decay_kernel` 可搜索（linear/gaussian/cosine），v7 未启用（先单独验证形状空间）。
+
+### (d) v7 运行中（`configs/nex25_mini_rocm_v7.toml`）
+
+standard + 判别层选择，5 个强度种子（0.25×→0.40×，含实测 17/100 @ 0.0434），40 trials。
+当前 160 口径坐标：目标框（≤10 且 KL≤0.05）仍空；退路线（≤10 且 ≤0.1）由阶段一模型
+9/100 @ 0.0845 守住。
 
 ---
 
