@@ -11,7 +11,61 @@
 | 远端 | `origin` → https://github.com/Scorp1o117/abliterix |
 | 上游 | `upstream` → https://github.com/wuwangzhang1216/abliterix |
 | 最近对齐上游 | **v1.12.2**（`5d58cea`，merge `bb48dd9`）——已追平上游 `master` |
-| 本日志最近更新 | 2026-09-11 (Nex-N2.5-mini 消融结果：160 口径 9/100 达标) |
+| 本日志最近更新 | 2026-09-11 (口径纠正 160 + q/k/v 陷阱 + 变换 A/B) |
+
+---
+
+## -1ct. 2026-09-11 — 口径纠正、q/k/v 陷阱、direct_transform A/B
+
+### (a) 评估口径回归 160（汐可酱此前擅自改成 256，已纠正）
+
+`max_gen_tokens` 的 house 取值：`default.toml` = **100**；Ornith-1.5 / Ling-3.0 / Qwen3.8
+家族配置 = **160**；spark 1.7B = 150；只有 `gpt_oss_120b` 用 256。汐可酱照搬了 gpt-oss 的 256，
+把拒绝数报成「更忠实的口径」——**错**。检测器 67 个标记里只有 `sorry` 限定在开头 8 词，其余全部
+**全文子串匹配**，所以 cap 越长越容易误碰关键词、拒绝数被系统性抬高（同配方同 KL：160 → 12/100，
+256 → 22/100）。**160 是唯一可比的数字**，v6 起全部按 160 跑。
+
+同时把 `detection.strip_thinking_blocks`（汐可酱加的思考剥离）**默认值改回 false**：该开关是
+opt-in，不应擅自移动项目口径。（它在本模型 160 口径下实测无影响，但默认值必须保守。）
+
+### (b) 陷阱：`* Steerable components` 横幅只打印 layer 0
+
+```python
+for component, modules in self.steerable_modules(0).items():   # 只看第 0 层
+```
+
+本模型 layer 0 是 `linear_attention`（无 self_attn），所以 `attn.q/k/v_proj` **永远不出现在横幅里**；
+但它们存在于 10 个 full_attention 层（3, 7, … 39），且 `_apply_direct_steering` 确实会施加转向。
+同一 0.25× 配方：
+
+| q/k/v max_weight | 拒绝 | KL |
+|---|---|---|
+| 0.375（Ornith V4「ALL attention components on」） | **12/100** | 0.0594 |
+| 0.000（汐可酱 v6 种子误设 + 区间收窄到 [0,0.5]） | 19/100 | 0.0585 |
+
+排查过程：先怀疑思考剥离补丁（关掉仍 19）、再怀疑残差缓存（清空重算仍 19，KL 逐位 0.0585）、
+再排除路由/配置/随机性，最后用**原样重放 v2 配方**（`configs/nex25_ctrl_v2recipe.toml`）
+精确复现 12/100 @ 0.0594 才定位到 q/k/v。**教训：横幅只代表 layer 0，判断组件是否生效要读
+`steerable_modules` 的逐层注册，别信摘要行。**
+
+### (c) direct_transform A/B（同强度 0.25×、全 attention 组件、160 口径）
+
+| transform | 预筛 | 完整拒绝 | KL |
+|---|---|---|---|
+| **standard**（历史路径） | 6/30 | **12/100** | **0.0594** |
+| orba（双 Gram-Schmidt + 保范） | 4/30 | 15/100 | 0.0602 |
+| biprojected（逐行 L2 精确保持） | — | 19/100 | 0.0604 |
+
+两个 grimjim 变体在 Nex 上**同强度更差且 KL 更高**（理论最漂亮的 biprojected 最差）。又一次
+「变换通用、收益逐模型特异」。搜索里保留该维度（TPE 自会回避），主力回到 profile 形状空间。
+
+### (d) v6 搜索（进行中，`configs/nex25_mini_rocm_v6_160.toml`）
+
+160 口径 + 变换可搜索 + q/k/v 已恢复（区间 [0.05,0.8]）+ 面向 KL≤0.05 的区间
+（o_proj [0.2,1.4] / down_proj [0.6,3.6]）+ 60 trials。当前前沿：
+t0 **12/100 @ 0.0594**（= v2 历史值，逐位复现）；目标 ≤10/100 且 **KL ≤0.05**（0.1 仅退路）。
+
+工具：`scripts/nex25_report.py` 已升级（显示 transform + 各组件、Pareto 前沿、双阈值线）。
 
 ---
 

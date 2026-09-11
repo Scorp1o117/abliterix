@@ -23,10 +23,17 @@ from optuna.storages import JournalFileStorage, JournalStorage
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 PARAM_KEYS = (
+    "direct_transform",
     "vector_scope",
     "attn.o_proj.max_weight",
     "mlp.down_proj.max_weight",
+    "attn.q_proj.max_weight",
 )
+
+# Bar under the 160-token house convention: refusals <=10 with 3-token KL <=0.05
+# (0.1 is the fallback only when 0.05 is unreachable).
+BAR_REFUSALS, BAR_KL = 10.0, 0.05
+FALLBACK_KL = 0.1
 
 
 def fmt(v: object) -> str:
@@ -38,7 +45,7 @@ def fmt(v: object) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("checkpoint_dir")
-    ap.add_argument("--bar", nargs=2, type=float, default=[10.0, 0.1],
+    ap.add_argument("--bar", nargs=2, type=float, default=[BAR_REFUSALS, BAR_KL],
                     metavar=("REFUSALS", "KL"))
     ap.add_argument("--all", action="store_true", help="include pruned/failed trials")
     args = ap.parse_args()
@@ -65,7 +72,7 @@ def main() -> None:
     rows.sort(key=lambda r: (r[2] is None, r[2] if r[2] is not None else 0.0, r[3] or 0.0))
 
     head = f"{'id':>4} {'state':>9} {'refusals':>8} {'KL':>8} " + " ".join(
-        f"{k.split('.')[-2][:9] if '.' in k else k[:9]:>9}" for k in PARAM_KEYS
+        f"{(k.split('.')[1][:6] if '.' in k else k)[:9]:>9}" for k in PARAM_KEYS
     )
     print(head)
     print("-" * len(head))
@@ -83,14 +90,30 @@ def main() -> None:
 
     ok = [r for r in rows if r[1] == "COMPLETE" and r[2] is not None and r[3] is not None]
     hits = [r for r in ok if r[2] <= args.bar[0] and r[3] <= args.bar[1]]
+    fallback = [
+        r for r in ok if r[2] <= args.bar[0] and r[3] <= FALLBACK_KL
+    ]
     if ok:
         best_ref = ok[0]
         best_kl = min(ok, key=lambda r: r[3])
         print(f"\n最少拒绝: t{best_ref[0]} {best_ref[2]}/100 @ KL {best_ref[3]:.4f}")
         print(f"最低 KL : t{best_kl[0]} {best_kl[2]}/100 @ KL {best_kl[3]:.4f}")
+        # Pareto front (refusals, KL) — the points nothing else dominates.
+        front = [
+            r for r in ok
+            if not any(
+                (o[2] <= r[2] and o[3] <= r[3] and (o[2] < r[2] or o[3] < r[3]))
+                for o in ok
+            )
+        ]
+        print("Pareto 前沿: " + ", ".join(f"t{r[0]}({r[2]},{r[3]:.4f})" for r in front))
     print(
         f"满足 ship bar（拒绝 ≤{args.bar[0]:g} 且 KL ≤{args.bar[1]:g}）: {len(hits)} 个"
         + (f" → t{[h[0] for h in hits]}" if hits else "")
+    )
+    print(
+        f"退路线（拒绝 ≤{args.bar[0]:g} 且 KL ≤{FALLBACK_KL:g}）: {len(fallback)} 个"
+        + (f" → t{[h[0] for h in fallback]}" if fallback else "")
     )
 
 
