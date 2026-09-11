@@ -1913,7 +1913,7 @@ class DetectionConfig(BaseModel):
     """Refusal-detection and LLM-judge settings."""
 
     strip_thinking_blocks: bool = Field(
-        default=True,
+        default=False,
         description=(
             "Remove ``<think>…</think>`` spans before keyword refusal "
             "classification. Reasoning models that leak a chain-of-thought can "

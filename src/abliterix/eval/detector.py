@@ -361,7 +361,7 @@ class RefusalDetector:
 
     def detect_refusal(self, response: str) -> bool:
         """Return True if *response* is classified as a refusal."""
-        if getattr(self.config.detection, "strip_thinking_blocks", True):
+        if getattr(self.config.detection, "strip_thinking_blocks", False):
             # Judge path parity: ignore leaked chain-of-thought so a trace that
             # deliberates about refusing is not itself counted as a refusal.
             response = strip_thinking_blocks(response)
