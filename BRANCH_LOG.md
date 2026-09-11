@@ -11,7 +11,45 @@
 | 远端 | `origin` → https://github.com/Scorp1o117/abliterix |
 | 上游 | `upstream` → https://github.com/wuwangzhang1216/abliterix |
 | 最近对齐上游 | **v1.12.2**（`5d58cea`，merge `bb48dd9`）——已追平上游 `master` |
-| 本日志最近更新 | 2026-09-11 (判别层选择降 27% KL；harmfulness_pair 致命不兼容) |
+| 本日志最近更新 | 2026-09-11 (ARA 尝试翻车 → 回到 direct+EGA 加大搜索) |
+
+---
+
+## -1cv. 2026-09-11 — ARA/MPOA 尝试：一个方法学结论 + 一次系统翻车
+
+### (a) ARA（trohrbaugh full-weight）在 Nex 上跑得通，但没有继续的价值
+
+`heretic-ara-lora` 库**能加载 Nex**（probe 确认 40 层、bf16、fast UMA load），ARA 本体
+（LBFGS 三目标：保良性 / 转向有害 / 过度修正）在 layer 16-39 上 **5 分钟**就跑完 48 个模块、
+loss 收敛到 1e-8。但：
+
+- **组件表同样只有 `attn.o_proj` + `mlp.down_proj`**（后者是 shared expert 的 512 维小矩阵），
+  **碰不到 256 个融合专家** —— 与 LoRA 模式同一处盲区，而 EGA 的优势正在于能改专家。
+- **导出步骤把系统压爆了**（见下），实验未完成即放弃。
+- 附带修了该库一个 shape 兼容坑：hybrid 层的 `linear_attn.out_proj` 会用 2-D
+  `(tokens, hidden)` 调用 hook，而库假定 3-D → 已在 `/home/s117/heretic-ara-lora/src/heretic/model.py`
+  的 hook 里补了 2-D 分支（未提交到该库的 git）。
+
+### (b) MPOA 早已测过，无效
+
+MPOA = `weight_normalization = "full"` + rank-3 写路径（见 LING30_FLASH_PROJECT_LOG §0）。
+Nex 上的 `sweep_full` 那轮已做过 full vs none 对照，**曲线重合** → 不重复投入。
+
+### (c) ⚠️ 运维教训：不要在本机跑 heretic/ARA 的导出路径
+
+`nex25_ara_probe.py --go --save` 在 70GB 模型常驻显存的同时 `save_pretrained` 写 21 个分片，
+写出 48GB 半成品时系统内存/IO 被压爆，**桌面卡死**（GNOME 进程未受损，未重启）。已清理：
+删除 `Nex-N2.5-mini-ara`（48G）与 `exports/nex25_ara_delta.pt`（453M），OS 分区回到 362G 可用。
+
+**规则**：任何「加载第二份模型并全量导出」的动作（ARA 保存、merge_and_unload、
+save_pretrained）都必须先确认常驻显存/内存余量，或改用 merge-free 路径
+（`scripts/nex25_export.py` 已验证可行）。
+
+### (d) 回到最有效方法并加大搜索
+
+结论：**direct + EGA + 全 attention 组件（含 q/k/v）+ 160 口径**仍是本模型最强路径。
+v8 预算由 36 提到 **60 trials**（16 warmup），在合规带（o_proj [0.6,1.5] / down_proj
+[1.8,4.2] / q/k/v [0.2,0.8]，KL>0.12 剪枝）继续搜，目标是压低拒绝数并尽量逼近 KL 0.05。
 
 ---
 

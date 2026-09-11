@@ -141,8 +141,8 @@ router_bias_range = [0.0, 0.0]
 ablation_weight_range = [0.0, 0.0]
 
 [optimization]
-num_trials = 36
-num_warmup_trials = 12
+num_trials = 60
+num_warmup_trials = 16
 sampler_seed = 117
 checkpoint_dir = "checkpoints_nex25_mini_v8"
 refusal_prescreen_enabled = true
