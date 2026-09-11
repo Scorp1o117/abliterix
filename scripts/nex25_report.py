@@ -68,27 +68,37 @@ def main() -> None:
         kl = t.user_attrs.get("kl_divergence")
         if ref is None and t.values:
             ref, kl = (list(t.values) + [None, None])[:2]
-        rows.append((t.number, t.state.name, ref, kl, t))
+        health = t.user_attrs.get("generation_health") or {}
+        # Degenerate generations are counted as refusals by the detector, so a
+        # health-failed trial's refusal number is not a usable operating point.
+        healthy = bool(health.get("passed", True))
+        rows.append((t.number, t.state.name, ref, kl, t, healthy))
     rows.sort(key=lambda r: (r[2] is None, r[2] if r[2] is not None else 0.0, r[3] or 0.0))
 
-    head = f"{'id':>4} {'state':>9} {'refusals':>8} {'KL':>8} " + " ".join(
-        f"{(k.split('.')[1][:6] if '.' in k else k)[:9]:>9}" for k in PARAM_KEYS
+    head = f"{'id':>4} {'state':>9} {'refusals':>8} {'KL':>8} {'health':>7} " + " ".join(
+        f"{(k.split('.')[1][:6] if '.' in k else k)[:8]:>8}" for k in PARAM_KEYS
     )
     print(head)
     print("-" * len(head))
-    for tid, st, ref, kl, t in rows:
+    for tid, st, ref, kl, t, healthy in rows:
         if not args.all and st != "COMPLETE":
             continue
         star = " "
         if st == "COMPLETE" and ref is not None and kl is not None:
             star = "★" if (ref <= args.bar[0] and kl <= args.bar[1]) else " "
         fk = f"{kl:.4f}" if isinstance(kl, float) else "—"
+        fh = "PASS" if healthy else "FAIL"
         print(
-            f"{star}{tid:>4} {st:>9} {str(ref):>8} {fk:>8} "
-            + " ".join(f"{fmt(t.params.get(k, '—')):>9}" for k in PARAM_KEYS)
+            f"{star}{tid:>4} {st:>9} {str(ref):>8} {fk:>8} {fh:>7} "
+            + " ".join(f"{fmt(t.params.get(k, '—')):>8}" for k in PARAM_KEYS)
         )
 
-    ok = [r for r in rows if r[1] == "COMPLETE" and r[2] is not None and r[3] is not None]
+    # Only health-passing trials are usable operating points: degenerate
+    # generations are counted as refusals, so their numbers are inflated.
+    ok = [
+        r for r in rows
+        if r[1] == "COMPLETE" and r[2] is not None and r[3] is not None and r[5]
+    ]
     hits = [r for r in ok if r[2] <= args.bar[0] and r[3] <= args.bar[1]]
     fallback = [
         r for r in ok if r[2] <= args.bar[0] and r[3] <= FALLBACK_KL
